@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P0 问题诊断</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .log { background: #f0f0f0; padding: 10px; margin: 10px 0; border-left: 4px solid #2196F3; }
+        .error { background: #ffebee; border-left-color: #f44336; }
+        .success { background: #e8f5e9; border-left-color: #4caf50; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+        #result { margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>🔍 P0 问题诊断工具</h1>
+    
+    <div>
+        <button onclick="testStore()">测试 1: Store 状态更新</button>
+        <button onclick="testAPI()">测试 2: API 调用</button>
+        <button onclick="testSSE()">测试 3: SSE 连接</button>
+        <button onclick="clearLogs()">清空日志</button>
+    </div>
+    
+    <div id="logs"></div>
+    <div id="result"></div>
+
+    <script type="module">
+        import { useStore } from './src/store/index.js';
+        
+        window.testStore = () => {
+            log('开始测试 Store...');
+            
+            const state = useStore.getState();
+            log('初始状态 - messages:', state.messages.length);
+            
+            // 添加测试消息
+            useStore.setState({ 
+                messages: [
+                    { id: 'test-1', role: 'user', content: '测试消息', timestamp: new Date().toISOString() },
+                    { id: 'test-2', role: 'assistant', content: 'AI 回复', timestamp: new Date().toISOString() }
+                ]
+            });
+            
+            const newState = useStore.getState();
+            log('✅ 更新后状态 - messages:', newState.messages.length);
+            log('消息列表:', JSON.stringify(newState.messages, null, 2));
+            
+            if (newState.messages.length === 2) {
+                log('✅ Store 工作正常！', 'success');
+                document.getElementById('result').innerHTML = `
+                    <div class="success">
+                        <h3>✅ Store 测试通过</h3>
+                        <p>消息数量：${newState.messages.length}</p>
+                        <pre>${JSON.stringify(newState.messages, null, 2)}</pre>
+                    </div>
+                `;
+            } else {
+                log('❌ Store 有问题！', 'error');
+            }
+        };
+        
+        window.testAPI = async () => {
+            log('开始测试 API...');
+            
+            try {
+                const api = await import('./src/services/api.js');
+                log('✅ API 模块加载成功');
+                
+                // 测试发送消息
+                log('发送测试请求到 /api/chat/send...');
+                
+                let eventCount = 0;
+                await api.chatAPI.sendChatStream(
+                    '你好',
+                    null,
+                    [],
+                    (data) => {
+                        eventCount++;
+                        log(`收到事件 #${eventCount}:`, data.type);
+                    }
+                );
+                
+                log(`✅ API 测试成功！共收到 ${eventCount} 个事件`, 'success');
+            } catch (error) {
+                log('❌ API 测试失败:', error.message, 'error');
+            }
+        };
+        
+        window.testSSE = async () => {
+            log('开始测试 SSE 连接...');
+            
+            try {
+                const response = await fetch('/api/chat/send?query=你好', {
+                    method: 'POST',
+                    headers: { 'Accept': 'text/event-stream' }
+                });
+                
+                log('HTTP 状态:', response.status);
+                log('Content-Type:', response.headers.get('content-type'));
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const text = decoder.decode(value, { stream: true });
+                    buffer += text;
+                    
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            try {
+                                const parsed = JSON.parse(data);
+                                log('📦 收到数据:', parsed.type);
+                            } catch (e) {
+                                log('原始数据:', data.substring(0, 100));
+                            }
+                        }
+                    }
+                }
+                
+                log('✅ SSE 连接正常', 'success');
+            } catch (error) {
+                log('❌ SSE 测试失败:', error.message, 'error');
+            }
+        };
+        
+        function log(message, type = '') {
+            const logsDiv = document.getElementById('logs');
+            const logEntry = document.createElement('div');
+            logEntry.className = `log ${type}`;
+            logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logsDiv.appendChild(logEntry);
+            console.log('[DIAGNOSE]', message);
+        }
+        
+        function clearLogs() {
+            document.getElementById('logs').innerHTML = '';
+            document.getElementById('result').innerHTML = '';
+        }
+        
+        // 暴露函数到全局
+        window.testStore = testStore;
+        window.testAPI = testAPI;
+        window.testSSE = testSSE;
+    </script>
+</body>
+</html>

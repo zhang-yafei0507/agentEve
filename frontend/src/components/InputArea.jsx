@@ -1,0 +1,232 @@
+import React, { useState, useRef } from 'react';
+import { useStore } from '../store';
+
+const InputArea = ({ onTogglePanel }) => {
+  // 关键修复：使用选择器来获取状态
+  const sendMessage = useStore((state) => state.sendMessage);
+  const selectedTools = useStore((state) => state.selectedTools);
+  const loadTools = useStore((state) => state.loadTools);
+  const tools = useStore((state) => state.tools);
+  const currentSessionId = useStore((state) => state.currentSessionId);
+  const messages = useStore((state) => state.messages);
+  
+  const [query, setQuery] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const [showToolPanel, setShowToolPanel] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const textareaRef = useRef(null);
+
+  // 快捷按钮配置
+  const quickActions = [
+    { id: 'fast', label: '快速', prompt: '', mode: 'fill' },
+    { id: 'image', label: '🖼️ 图像', prompt: '请生成或分析图像：', mode: 'fill' },
+    { id: 'deep', label: '🔬 深入', prompt: '请从多个角度深入分析：', mode: 'fill' },
+    { id: 'write', label: '✍️ 写作', prompt: '请帮我撰写：', mode: 'fill' },
+  ];
+
+  const handleQuickActionClick = (action) => {
+    if (action.mode === 'fill') {
+      setQuery(action.prompt);
+      // 聚焦到输入框会在下次渲染时自动进行
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault(); // 必须阻止表单提交
+    console.log('[InputArea] 提交消息:', query, 'sessionId:', currentSessionId);
+    
+    if (!query.trim() || isSending) {
+      console.log('[InputArea] 跳过发送：', !query.trim() ? '内容空白' : '正在发送');
+      return;
+    }
+
+    setIsSending(true);
+    const originalQuery = query;
+    setQuery(''); // 清空输入框
+
+    try {
+      await sendMessage(originalQuery, (event) => {
+        console.log('[InputArea] SSE Event:', event);
+      });
+      console.log('[InputArea] 消息发送成功');
+    } catch (error) {
+      console.error('[InputArea] 发送消息失败:', error);
+      // 不跳转，只显示错误提示
+      alert('发送失败，请重试');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault(); // 阻止换行
+      handleSubmit(e);
+    }
+  };
+
+  return (
+    <div className="border-t border-gray-200 bg-white p-4">
+      {/* 工具栏 - 始终显示 */}
+      <div className="mb-3 flex items-center gap-2 overflow-x-auto pb-2">
+        <button
+          onClick={() => setShowToolPanel(!showToolPanel)}
+          className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap"
+        >
+          🔍 联网
+        </button>
+        <button className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap">
+          📁 上传
+        </button>
+        <button className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap">
+          🧮 代码
+        </button>
+        <button className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap">
+          📊 数据分析
+        </button>
+        <button className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap">
+          🎨 图像
+        </button>
+        <button className="px-3 py-1.5 bg-gray-100 rounded-lg text-sm hover:bg-gray-200 transition-colors whitespace-nowrap">
+          📝 写作
+        </button>
+        <button
+          onClick={onTogglePanel}
+          className="px-3 py-1.5 bg-blue-100 text-primary rounded-lg text-sm hover:bg-blue-200 transition-colors whitespace-nowrap font-medium"
+        >
+          👁️ 协作流程
+        </button>
+      </div>
+
+      {/* 输入框 - 发送按钮内置在右侧 */}
+      <form onSubmit={handleSubmit} className="relative">
+        <div
+          className={`min-h-[56px] max-h-[200px] rounded-3xl border transition-all flex items-center ${
+            isFocused
+              ? 'border-primary ring-2 ring-blue-100'
+              : 'border-gray-300'
+          } bg-white px-4`}
+        >
+          <textarea
+            ref={textareaRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onFocus={() => setIsFocused(true)}
+            onBlur={() => setIsFocused(false)}
+            onKeyPress={handleKeyPress}
+            placeholder="发消息..."
+            className="flex-1 w-full h-full min-h-[40px] max-h-[160px] resize-none outline-none text-gray-800 placeholder-gray-400 py-3 pr-3 bg-transparent"
+            rows={1}
+            style={{ minHeight: '40px' }}
+          />
+          
+          {/* 发送按钮 - 固定在输入框右侧 */}
+          <button
+            type="submit"
+            disabled={!query.trim() || isSending}
+            className={`ml-3 w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 transition-colors ${
+              query.trim() && !isSending
+                ? 'bg-primary text-white hover:bg-blue-600'
+                : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+            }`}
+          >
+            {isSending ? (
+              <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+            ) : (
+              '➤'
+            )}
+          </button>
+        </div>
+
+        {/* 字数统计 */}
+        <div className="mt-2">
+          <div className="text-xs text-gray-400">
+            {query.trim() ? `${query.trim().length} 字` : ''}
+          </div>
+        </div>
+      </form>
+
+      {/* 工具选择面板 */}
+      {showToolPanel && (
+        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-[640px] max-h-[480px] bg-white rounded-xl shadow-2xl border border-gray-200 overflow-hidden z-50">
+          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+            <h3 className="font-medium">选择工具</h3>
+            <button
+              onClick={() => setShowToolPanel(false)}
+              className="text-gray-400 hover:text-gray-600"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="p-4 border-b border-gray-200">
+            <input
+              type="text"
+              placeholder="搜索工具..."
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:border-primary"
+            />
+          </div>
+
+          <div className="p-4 overflow-y-auto max-h-[320px]">
+            <div className="space-y-4">
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2">🌐 网络检索</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { name: '网页搜索', icon: '🌐' },
+                    { name: '新闻搜索', icon: '📰' },
+                    { name: '学术搜索', icon: '🎓' }
+                  ].map((tool, index) => (
+                    <div
+                      key={index}
+                      className="p-3 border border-gray-200 rounded-lg hover:border-primary cursor-pointer transition-colors"
+                    >
+                      <div className="text-2xl mb-1">{tool.icon}</div>
+                      <div className="text-sm font-medium">{tool.name}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2">📊 数据分析</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { name: '图表生成', icon: '📈' },
+                    { name: '计算器', icon: '🧮' },
+                    { name: '趋势预测', icon: '📉' }
+                  ].map((tool, index) => (
+                    <div
+                      key={index}
+                      className="p-3 border border-gray-200 rounded-lg hover:border-primary cursor-pointer transition-colors"
+                    >
+                      <div className="text-2xl mb-1">{tool.icon}</div>
+                      <div className="text-sm font-medium">{tool.name}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-4 border-t border-gray-200 flex items-center justify-end gap-2">
+            <button
+              onClick={() => setShowToolPanel(false)}
+              className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+            >
+              取消
+            </button>
+            <button
+              onClick={() => setShowToolPanel(false)}
+              className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors"
+            >
+              确认
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default InputArea;
