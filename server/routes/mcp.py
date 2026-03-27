@@ -10,6 +10,7 @@ from typing import Optional
 
 from ..utils.db_init import get_db
 from ..utils.database import MCPServer, Tool
+from ..mcp.client import MCPClient
 
 router = APIRouter()
 
@@ -90,45 +91,69 @@ async def connect_and_discover_tools(
     db: AsyncSession,
     auto_enable: bool
 ):
-    """连接 MCP 服务器并发现工具"""
-    # MVP: 模拟连接过程
-    # TODO: 实际实现需要使用 MCP SDK
+    """连接 MCP 服务器并发现工具（真实实现）"""
+    print(f"[MCP] 🔌 正在连接服务器：{mcp_server.name}")
     
     mcp_server.status = "connecting"
     await db.commit()
     
-    # 模拟连接延迟
-    await asyncio.sleep(2)
-    
-    # 模拟成功连接
-    mcp_server.status = "connected"
-    
-    # 模拟发现工具
-    mock_tools = [
-        {
-            "name": f"{mcp_server.name}_tool_1",
-            "description": f"来自 {mcp_server.name} 的工具 1",
-            "category": "MCP 工具",
-            "icon": "🛠️"
-        },
-        {
-            "name": f"{mcp_server.name}_tool_2",
-            "description": f"来自 {mcp_server.name} 的工具 2",
-            "category": "MCP 工具",
-            "icon": "🔧"
-        }
-    ]
-    
-    for tool_data in mock_tools:
-        tool = Tool(
-            **tool_data,
-            is_mcp=True,
-            mcp_server_id=mcp_server.id,
-            is_enabled=auto_enable
-        )
-        db.add(tool)
-    
-    await db.commit()
+    try:
+        # 创建 MCP 客户端
+        client = MCPClient({
+            "name": mcp_server.name,
+            "connection_type": mcp_server.connection_type,
+            "command": mcp_server.command,
+            "url": mcp_server.url,
+            "env_vars": mcp_server.env_vars
+        })
+        
+        # 连接并获取工具列表
+        await client.connect()
+        
+        # 更新状态
+        mcp_server.status = "connected"
+        mcp_server.error_message = None
+        
+        # 注册发现的工具到数据库
+        discovered_count = 0
+        for tool_data in client.get_tools():
+            # 检查工具是否已存在
+            existing = await db.execute(
+                select(Tool).where(
+                    Tool.name == tool_data.get("name"),
+                    Tool.mcp_server_id == mcp_server.id
+                )
+            )
+            if existing.scalar_one_or_none():
+                continue
+            
+            # 创建新工具
+            tool = Tool(
+                name=tool_data.get("name", "unknown"),
+                description=tool_data.get("description", ""),
+                category=tool_data.get("category", "MCP 工具"),
+                icon=tool_data.get("icon", "🛠️"),
+                is_mcp=True,
+                mcp_server_id=mcp_server.id,
+                config_schema=tool_data.get("inputSchema", {}),  # JSON Schema
+                is_enabled=auto_enable
+            )
+            db.add(tool)
+            discovered_count += 1
+        
+        await db.commit()
+        
+        # 断开客户端（工具信息已保存到数据库）
+        await client.disconnect()
+        
+        print(f"[MCP] ✅ 连接成功，发现 {discovered_count} 个工具")
+        
+    except Exception as e:
+        print(f"[MCP] ❌ 连接失败：{e}")
+        mcp_server.status = "error"
+        mcp_server.error_message = str(e)
+        await db.commit()
+        raise
 
 
 @router.delete("/servers/{server_id}")
@@ -151,7 +176,7 @@ async def delete_mcp_server(server_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/servers/{server_id}/test")
 async def test_mcp_server(server_id: str, db: AsyncSession = Depends(get_db)):
-    """测试 MCP 服务器连接"""
+    """测试 MCP 服务器连接（真实实现）"""
     result = await db.execute(
         select(MCPServer).where(MCPServer.id == server_id)
     )
@@ -160,26 +185,47 @@ async def test_mcp_server(server_id: str, db: AsyncSession = Depends(get_db)):
     if not server:
         raise HTTPException(status_code=404, detail="服务器不存在")
     
-    # MVP: 模拟测试
-    # TODO: 实际发送测试请求
-    
-    success = True
-    error_msg = None
-    
-    if not success:
-        server.status = "error"
-        server.error_message = error_msg
-    else:
+    try:
+        # 创建临时客户端进行测试
+        client = MCPClient({
+            "name": server.name,
+            "connection_type": server.connection_type,
+            "command": server.command,
+            "url": server.url,
+            "env_vars": server.env_vars
+        })
+        
+        # 尝试连接
+        await client.connect()
+        
+        # 获取工具列表
+        tools = client.get_tools()
+        
+        # 断开连接
+        await client.disconnect()
+        
+        # 更新状态
         server.status = "connected"
         server.error_message = None
-    
-    await db.commit()
-    
-    return {
-        "success": success,
-        "status": server.status,
-        "message": "连接成功" if success else error_msg
-    }
+        await db.commit()
+        
+        return {
+            "success": True,
+            "status": server.status,
+            "tools_discovered": len(tools),
+            "message": f"连接成功，发现 {len(tools)} 个工具"
+        }
+        
+    except Exception as e:
+        server.status = "error"
+        server.error_message = str(e)
+        await db.commit()
+        
+        return {
+            "success": False,
+            "status": server.status,
+            "message": f"连接失败：{str(e)}"
+        }
 
 
 @router.get("/tools/discover")

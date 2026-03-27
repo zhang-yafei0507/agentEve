@@ -351,6 +351,27 @@ async def send_message(
     )
 
 
+@router.get("/quick-questions")
+async def get_quick_questions(category: str = None):
+    """获取快捷提问列表"""
+    questions = [
+        {"text": "帮我分析一下特斯拉 2025 年 Q1 财报", "category": "analysis"},
+        {"text": "最近 AI 领域有什么重要新闻？", "category": "research"},
+        {"text": "用 Python 写一个快速排序算法", "category": "coding"},
+        {"text": "对比比亚迪和蔚来汽车的商业模式", "category": "analysis"},
+        {"text": "帮我写一篇关于气候变化的科普文章", "category": "writing"},
+        {"text": "查询英伟达最新股价和市值", "category": "research"},
+        {"text": "解释什么是 Transformer 架构", "category": "analysis"},
+        {"text": "创建一个简单的待办事项管理网页", "category": "coding"},
+        {"text": "总结《人类简史》这本书的核心观点", "category": "writing"}
+    ]
+
+    if category:
+        questions = [q for q in questions if q["category"] == category]
+
+    return {"questions": questions[:9]}  # 最多返回 9 个
+
+
 @router.get("/history/{session_id}")
 async def get_session_history(session_id: str, db: AsyncSession = Depends(get_db)):
     """获取会话历史消息"""

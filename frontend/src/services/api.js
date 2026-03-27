@@ -104,6 +104,13 @@ export const chatAPI = {
     }
   },
   
+  // 获取快捷问题
+  getQuickQuestions: async (category = null) => {
+    const params = category ? { category } : {};
+    const response = await api.get('/chat/quick-questions', { params });
+    return response.data;
+  },
+  
   // 获取会话历史
   getHistory: async (sessionId) => {
     console.log('[API] getHistory - sessionId:', sessionId);
@@ -227,6 +234,7 @@ export default {
   // 聊天相关
   sendChatStream: chatAPI.sendChatStream,
   getHistory: chatAPI.getHistory,
+  getQuickQuestions: chatAPI.getQuickQuestions,
   
   // 便捷方法：获取会话历史（使用 chat API）
   getSessionHistory: chatAPI.getHistory,

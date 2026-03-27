@@ -188,7 +188,7 @@ class SubAgent:
 
 请认真分析并完成任务，提供详细、专业、有深度的回答。使用中文回复。"""
                 
-                user_message = f"请完成以下任务：{self.task}\n\n用户原始查询：{self.context.get('query', '') if self.context else ''}"
+                user_message = f"请完成以下任务：{self.task}\n\n用户原始查询：请根据任务描述完成相关工作。"
                 
                 messages = [
                     {"role": "system", "content": system_prompt},
@@ -254,10 +254,13 @@ class SupervisorAgent:
         self.sub_agents: List[SubAgent] = []
         self.shared_board: Optional[SharedBoard] = None
     
-    async def analyze_intent(self, query: str) -> Dict:
-        """分析用户意图（增强版）"""
-        # MVP: 规则 + 关键词匹配
-        # TODO: 使用 LLM 进行深度语义分析
+    async def analyze_intent(self, query: str, llm_client=None) -> Dict:
+        """分析用户意图（LLM 增强版）"""
+        # 如果有 LLM 客户端，使用 LLM 进行深度语义分析
+        if llm_client:
+            return await self.analyze_intent_with_llm(query, llm_client)
+        
+        # 降级方案：规则 + 关键词匹配
         complexity = "simple"
         required_domains = []
         entities = []
@@ -326,10 +329,84 @@ class SupervisorAgent:
             "requires_multi_agent": complexity == "complex"
         }
     
-    async def decompose_task(self, query: str, intent: Dict) -> List[Dict]:
-        """拆解任务（增强版）"""
-        # MVP: 基于规则的拆解
-        # TODO: 使用 LLM 进行智能拆解
+    async def analyze_intent_with_llm(self, query: str, llm_client) -> Dict:
+        """使用 LLM 进行深度意图分析"""
+        try:
+            system_prompt = """你是一个专业的任务分析专家。请分析用户查询并返回 JSON 格式的分析结果。
+
+请严格按照以下 JSON Schema 返回：
+{
+    "complexity": "simple/medium/complex",
+    "required_domains": ["research", "analysis", "coding", "writing"...],
+    "entities": [{"name": "实体名", "type": "公司/人物/事件..."}],
+    "implicit_needs": ["需要最新数据", "需要对比分析"...],
+    "suggested_agents": ["Researcher", "Analyzer", "Coder", "Writer"...],
+    "reasoning": "简要说明分析理由"
+}
+
+判断标准：
+- simple: 单一事实查询、简单计算、常识性问题
+- medium: 需要多步骤处理、基础数据分析、简单创作
+- complex: 需要多智能体协作、网络搜索、复杂分析、长篇创作
+
+领域定义：
+- research: 需要检索信息、查找资料
+- analysis: 需要数据分析、对比评估
+- coding: 需要编写代码、技术方案
+- writing: 需要创作文案、报告、文章"""
+            
+            user_message = f"请分析以下用户查询：\n\n{query}"
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+            
+            result = await llm_client.chat_completion(
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1024,
+                stream=False
+            )
+            
+            # 解析 JSON 响应
+            import json
+            content = result["content"]
+            
+            # 尝试提取 JSON（如果 LLM 返回了额外的文本）
+            start_idx = content.find("{")
+            end_idx = content.rfind("}") + 1
+            if start_idx >= 0 and end_idx > start_idx:
+                json_str = content[start_idx:end_idx]
+            else:
+                json_str = content
+            
+            analysis = json.loads(json_str)
+            
+            print(f"[Intent] LLM 分析结果：{analysis}")
+            
+            return {
+                "complexity": analysis.get("complexity", "medium"),
+                "domains": analysis.get("required_domains", []),
+                "entities": analysis.get("entities", []),
+                "implicit_needs": analysis.get("implicit_needs", []),
+                "suggested_agents": analysis.get("suggested_agents", []),
+                "reasoning": analysis.get("reasoning", ""),
+                "requires_multi_agent": analysis.get("complexity") in ["complex", "medium"]
+            }
+            
+        except Exception as e:
+            print(f"[Intent] LLM 分析失败，降级到规则匹配：{e}")
+            # 降级到规则匹配
+            return await self.analyze_intent(query)
+    
+    async def decompose_task(self, query: str, intent: Dict, llm_client=None) -> List[Dict]:
+        """拆解任务（LLM 增强版）"""
+        # 如果有 LLM 客户端，使用 LLM 进行智能拆解
+        if llm_client:
+            return await self.decompose_task_with_llm(query, intent, llm_client)
+        
+        # 降级方案：基于规则的拆解
         sub_tasks = []
         
         # 检测是否包含网络搜索需求
@@ -364,6 +441,104 @@ class SupervisorAgent:
         
         return sub_tasks[:4]  # 最多 4 个子智能体
     
+    async def decompose_task_with_llm(self, query: str, intent: Dict, llm_client) -> List[Dict]:
+        """使用 LLM 进行智能任务拆解"""
+        try:
+            system_prompt = """你是一个专业的任务规划师。请将复杂任务拆解为可执行的子任务。
+
+请严格按照以下 JSON Schema 返回子任务列表：
+[
+    {
+        "role": "Researcher/Analyzer/Coder/Writer/Reviewer",
+        "task": "具体任务描述",
+        "depends_on": [],  // 依赖的子任务索引，如 [0] 表示依赖第一个任务
+        "tools": ["工具名 1", "工具名 2"]  // 建议使用的工具
+    }
+]
+
+角色定义：
+- Researcher: 负责信息检索、网络搜索、资料收集
+- Analyzer: 负责数据分析、对比评估、洞察提取
+- Coder: 负责编写代码、技术方案实现
+- Writer: 负责文案创作、报告撰写、内容整合
+- Reviewer: 负责质量审核、事实核查、一致性验证
+
+拆解原则：
+1. 每个子任务应该是独立可执行的
+2. 明确任务间的依赖关系（串行/并行）
+3. 合理分配工具使用
+4. 最多创建 4 个子任务
+5. 确保任务顺序符合逻辑"""
+            
+            user_message = f"""请基于以下意图分析结果，将任务拆解为子任务：
+
+用户查询：{query}
+
+意图分析：
+- 复杂度：{intent.get('complexity', 'medium')}
+- 领域：{intent.get('domains', [])}
+- 实体：{intent.get('entities', [])}
+- 隐含需求：{intent.get('implicit_needs', [])}
+- 推荐智能体：{intent.get('suggested_agents', [])}
+
+请输出 JSON 数组格式的子任务列表。"""
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+            
+            result = await llm_client.chat_completion(
+                messages=messages,
+                temperature=0.5,
+                max_tokens=2048,
+                stream=False
+            )
+            
+            # 解析 JSON 响应
+            import json
+            content = result["content"]
+            
+            # 尝试提取 JSON 数组
+            start_idx = content.find("[")
+            end_idx = content.rfind("]") + 1
+            if start_idx >= 0 and end_idx > start_idx:
+                json_str = content[start_idx:end_idx]
+            else:
+                json_str = content
+            
+            sub_tasks = json.loads(json_str)
+            
+            print(f"[Decompose] LLM 拆解结果：{sub_tasks}")
+            
+            # 验证和规范化
+            validated_tasks = []
+            for i, task in enumerate(sub_tasks[:4]):  # 最多 4 个
+                role = task.get("role", "Researcher")
+                # 标准化角色名称
+                role_mapping = {
+                    "researcher": AgentRole.RESEARCHER,
+                    "analyzer": AgentRole.ANALYZER,
+                    "coder": AgentRole.CODER,
+                    "writer": AgentRole.WRITER,
+                    "reviewer": AgentRole.REVIEWER
+                }
+                normalized_role = role_mapping.get(role.lower(), AgentRole.RESEARCHER)
+                
+                validated_tasks.append({
+                    "role": normalized_role,
+                    "task": task.get("task", ""),
+                    "depends_on": task.get("depends_on", []),
+                    "tools": task.get("tools", [])
+                })
+            
+            return validated_tasks
+            
+        except Exception as e:
+            print(f"[Decompose] LLM 拆解失败，降级到规则匹配：{e}")
+            # 降级到规则匹配
+            return await self.decompose_task(query, intent)
+    
     async def create_sub_agents(self, sub_tasks: List[Dict]) -> List[SubAgent]:
         """创建子智能体"""
         agents = []
@@ -397,8 +572,8 @@ class SupervisorAgent:
             query: 用户查询
             llm_client: LLM 客户端（可选）
         """
-        # 1. 意图分析
-        intent = await self.analyze_intent(query)
+        # 1. 意图分析（传入 LLM 客户端）
+        intent = await self.analyze_intent(query, llm_client=llm_client)
         
         # 2. 判断是否需要多智能体
         if not intent["requires_multi_agent"]:
@@ -430,8 +605,8 @@ class SupervisorAgent:
         # 3. 复杂任务：创建共享状态板
         self.shared_board = SharedBoard(str(uuid.uuid4()))
         
-        # 4. 任务拆解
-        sub_tasks = await self.decompose_task(query, intent)
+        # 4. 任务拆解（传入 LLM 客户端）
+        sub_tasks = await self.decompose_task(query, intent, llm_client=llm_client)
         
         # 5. 创建子智能体
         self.sub_agents = await self.create_sub_agents(sub_tasks)

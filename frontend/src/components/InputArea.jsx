@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useStore } from '../store';
+import ToolSelector from './ToolSelector';
 
 const InputArea = ({ onTogglePanel }) => {
   // 关键修复：使用选择器来获取状态
@@ -146,85 +147,8 @@ const InputArea = ({ onTogglePanel }) => {
         </div>
       </form>
 
-      {/* 工具选择面板 */}
-      {showToolPanel && (
-        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-[640px] max-h-[480px] bg-white rounded-xl shadow-2xl border border-gray-200 overflow-hidden z-50">
-          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-            <h3 className="font-medium">选择工具</h3>
-            <button
-              onClick={() => setShowToolPanel(false)}
-              className="text-gray-400 hover:text-gray-600"
-            >
-              ✕
-            </button>
-          </div>
-
-          <div className="p-4 border-b border-gray-200">
-            <input
-              type="text"
-              placeholder="搜索工具..."
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:border-primary"
-            />
-          </div>
-
-          <div className="p-4 overflow-y-auto max-h-[320px]">
-            <div className="space-y-4">
-              <div>
-                <h4 className="text-sm font-medium text-gray-700 mb-2">🌐 网络检索</h4>
-                <div className="grid grid-cols-3 gap-3">
-                  {[
-                    { name: '网页搜索', icon: '🌐' },
-                    { name: '新闻搜索', icon: '📰' },
-                    { name: '学术搜索', icon: '🎓' }
-                  ].map((tool, index) => (
-                    <div
-                      key={index}
-                      className="p-3 border border-gray-200 rounded-lg hover:border-primary cursor-pointer transition-colors"
-                    >
-                      <div className="text-2xl mb-1">{tool.icon}</div>
-                      <div className="text-sm font-medium">{tool.name}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <h4 className="text-sm font-medium text-gray-700 mb-2">📊 数据分析</h4>
-                <div className="grid grid-cols-3 gap-3">
-                  {[
-                    { name: '图表生成', icon: '📈' },
-                    { name: '计算器', icon: '🧮' },
-                    { name: '趋势预测', icon: '📉' }
-                  ].map((tool, index) => (
-                    <div
-                      key={index}
-                      className="p-3 border border-gray-200 rounded-lg hover:border-primary cursor-pointer transition-colors"
-                    >
-                      <div className="text-2xl mb-1">{tool.icon}</div>
-                      <div className="text-sm font-medium">{tool.name}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="p-4 border-t border-gray-200 flex items-center justify-end gap-2">
-            <button
-              onClick={() => setShowToolPanel(false)}
-              className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-            >
-              取消
-            </button>
-            <button
-              onClick={() => setShowToolPanel(false)}
-              className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-blue-600 transition-colors"
-            >
-              确认
-            </button>
-          </div>
-        </div>
-      )}
+      {/* 使用新的 ToolSelector 组件 */}
+      <ToolSelector isOpen={showToolPanel} onClose={() => setShowToolPanel(false)} />
     </div>
   );
 };
