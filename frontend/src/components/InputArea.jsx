@@ -17,21 +17,6 @@ const InputArea = ({ onTogglePanel }) => {
   const [isSending, setIsSending] = useState(false);
   const textareaRef = useRef(null);
 
-  // 快捷按钮配置
-  const quickActions = [
-    { id: 'fast', label: '快速', prompt: '', mode: 'fill' },
-    { id: 'image', label: '🖼️ 图像', prompt: '请生成或分析图像：', mode: 'fill' },
-    { id: 'deep', label: '🔬 深入', prompt: '请从多个角度深入分析：', mode: 'fill' },
-    { id: 'write', label: '✍️ 写作', prompt: '请帮我撰写：', mode: 'fill' },
-  ];
-
-  const handleQuickActionClick = (action) => {
-    if (action.mode === 'fill') {
-      setQuery(action.prompt);
-      // 聚焦到输入框会在下次渲染时自动进行
-    }
-  };
-
   const handleSubmit = async (e) => {
     e.preventDefault(); // 必须阻止表单提交
     console.log('[InputArea] 提交消息:', query, 'sessionId:', currentSessionId);

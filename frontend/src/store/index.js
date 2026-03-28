@@ -128,9 +128,21 @@ export const useStore = create((set, get) => ({
     const state = get();
     console.log('[Store] sendMessage - query:', query, 'sessionId:', state.currentSessionId);
     
+    // 关键修复：在函数开始处就检查重复
+    const existingMessage = state.messages.find(
+      m => m.role === 'user' && 
+           m.content === query && 
+           (Date.now() - new Date(m.timestamp).getTime()) < 10000
+    );
+    
+    if (existingMessage) {
+      console.warn('[Store] ❌ 检测到重复消息，直接返回');
+      return; // 直接返回，不执行后续逻辑
+    }
+    
     set({ isStreaming: true, isLoading: true });
     
-    // 关键修复：生成唯一的临时 ID，避免重复
+    // 生成唯一的临时 ID
     const tempMessageId = `user-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
     // 乐观更新用户消息到本地（带唯一 ID）
@@ -149,15 +161,15 @@ export const useStore = create((set, get) => ({
     set(prevState => {
       console.log('[Store] ⚠️ 关键：set 回调中的 prevState.messages.length =', prevState.messages.length);
       
-      // 防止重复：检查是否已存在相同内容的消息（10 秒内）
-      const existingMessage = prevState.messages.find(
+      // 二次检查：防止在 set 回调期间被其他操作添加
+      const doubleCheck = prevState.messages.find(
         m => m.role === 'user' && 
              m.content === query && 
              (Date.now() - new Date(m.timestamp).getTime()) < 10000
       );
       
-      if (existingMessage) {
-        console.warn('[Store] 检测到重复消息，跳过添加');
+      if (doubleCheck) {
+        console.warn('[Store] ⚠️ 二次检查发现重复，跳过添加');
         return prevState; // 不重复添加
       }
       
@@ -169,7 +181,13 @@ export const useStore = create((set, get) => ({
       };
     });
     
-    console.log('[Store] ✅ 用户消息添加结果:', messageAdded ? '成功' : '失败（可能是重复消息）');
+    console.log('[Store] ✅ 用户消息添加结果:', messageAdded ? '成功' : '失败（重复消息）');
+    
+    if (!messageAdded) {
+      // 如果消息未添加（重复），直接返回
+      set({ isStreaming: false, isLoading: false });
+      return;
+    }
     
     // 使用 Ref 模式维护流式状态（关键修复）
     const streamState = {

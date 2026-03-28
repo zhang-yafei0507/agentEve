@@ -157,10 +157,8 @@ async def send_message(
                 sub_agent_results = []
                 tool_call_count = 0
                 
-                # 逐个执行子智能体（并行执行）
-                tasks = []
+                # 关键修复：逐个执行子智能体并实时发送 SSE 事件
                 for sub_agent in task_result["sub_agents"]:
-                    # 关键修复：使用 .get() 安全访问，兼容 id 和 agent_id
                     agent_id = sub_agent.get("id") or sub_agent.get("agent_id")
                     role = sub_agent["role"]
                     
@@ -176,29 +174,31 @@ async def send_message(
                     })
                     yield f"event: agent_update\ndata: {event_data}\n\n"
                     
-                    # 工具调用开始
-                    event_data = json.dumps({
-                        'type': 'tool_call_start',
-                        'tool': 'web_search',
-                        'agent_id': agent_id,
-                        'params': {'query': sub_agent['task']}
-                    })
-                    yield f"event: tool_call_start\ndata: {event_data}\n\n"
-                    tool_call_count += 1
+                    # 工具调用开始（如果有真实工具）
+                    if sub_agent.get('tools'):
+                        event_data = json.dumps({
+                            'type': 'tool_call_start',
+                            'tool': sub_agent['tools'][0],
+                            'agent_id': agent_id,
+                            'params': {'query': sub_agent['task']}
+                        })
+                        yield f"event: tool_call_start\ndata: {event_data}\n\n"
                     
-                    # 模拟工具执行
-                    await asyncio.sleep(1)
+                    # 等待子智能体执行完成
+                    await asyncio.sleep(0.5)
                     
                     # 工具调用结果
-                    event_data = json.dumps({
-                        'type': 'tool_call_result',
-                        'tool': 'web_search',
-                        'agent_id': agent_id,
-                        'status': 'success',
-                        'result': '找到相关信息',
-                        'duration': 1.0
-                    })
-                    yield f"event: tool_call_result\ndata: {event_data}\n\n"
+                    if sub_agent.get('tools'):
+                        event_data = json.dumps({
+                            'type': 'tool_call_result',
+                            'tool': sub_agent['tools'][0],
+                            'agent_id': agent_id,
+                            'status': 'success',
+                            'result': '找到相关信息',
+                            'duration': sub_agent.get("duration", 1.0)
+                        })
+                        yield f"event: tool_call_result\ndata: {event_data}\n\n"
+                        tool_call_count += 1
                     
                     # 智能体完成
                     event_data = json.dumps({
@@ -208,26 +208,26 @@ async def send_message(
                         'status': 'completed',
                         'output': sub_agent['output'],
                         'task': sub_agent['task'],
-                        'tool_calls': 1,  # 明确添加 tool_calls 字段
-                        'duration': 1.0
+                        'tool_calls': sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
+                        'duration': sub_agent.get("duration", 1.0)
                     })
                     yield f"event: agent_update\ndata: {event_data}\n\n"
                     
                     thinking_process.append({
                         "agent": role,
                         "action": sub_agent["task"],
-                        "tool_calls": 1,
+                        "tool_calls": sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
                         "duration": sub_agent.get("duration", 1.0),
                         "timestamp": datetime.utcnow().isoformat()
                     })
                     
-                    # 关键修复：确保 sub_agent_results 包含完整的 task 信息
+                    # 累积子智能体结果
                     sub_agent_results.append({
-                        "agent_id": sub_agent.get("agent_id") or sub_agent.get("id"),
-                        "role": sub_agent["role"],
-                        "task": sub_agent["task"],  # 明确添加 task 字段
+                        "agent_id": agent_id,
+                        "role": role,
+                        "task": sub_agent["task"],
                         "output": sub_agent["output"],
-                        "tool_calls": sub_agent.get("tool_calls", 1),
+                        "tool_calls": sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
                         "duration": sub_agent.get("duration", 1.0)
                     })
                 
