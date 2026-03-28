@@ -196,7 +196,13 @@ export const useStore = create((set, get) => ({
       messageCreated: false,
       // 关键修复：实时累积结构化数据
       thinkingProcess: [],
-      subAgentResults: []
+      subAgentResults: [],
+      // 新增：主智能体思考过程
+      supervisorThoughts: [],
+      // 新增：任务规划
+      taskPlan: null,
+      // 新增：工具调用记录
+      toolCalls: []
     };
     
     try {
@@ -222,6 +228,96 @@ export const useStore = create((set, get) => ({
             streamState.accumulatedContent = '';
             streamState.messageCreated = false;
             set({ currentSessionId: data.session_id });
+            
+          } else if (data.type === 'supervisor_thought') {
+            // 新增：主智能体思考过程
+            console.log('[Store] supervisor_thought:', data.action, data.message);
+            streamState.supervisorThoughts.push({
+              action: data.action,
+              message: data.message,
+              step: data.step || null,
+              timestamp: new Date().toISOString()
+            });
+            
+            // 实时更新消息中的思考过程
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+              
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  supervisor_thoughts: [...streamState.supervisorThoughts],
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
+            });
+            
+          } else if (data.type === 'supervisor_decision') {
+            // 新增：主智能体决策
+            console.log('[Store] supervisor_decision:', data.decision, data.message);
+            streamState.supervisorThoughts.push({
+              type: 'decision',
+              decision: data.decision,
+              message: data.message,
+              reasoning: data.reasoning || '',
+              timestamp: new Date().toISOString()
+            });
+            
+          } else if (data.type === 'task_plan') {
+            // 新增：任务规划
+            console.log('[Store] task_plan:', data.total_steps, 'steps');
+            streamState.taskPlan = {
+              total_steps: data.total_steps,
+              steps: data.steps || [],
+              timestamp: new Date().toISOString()
+            };
+            
+            // 实时更新消息中的任务规划
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+              
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  task_plan: streamState.taskPlan,
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
+            });
+            
+          } else if (data.type === 'tool_call_start') {
+            // 工具调用开始
+            console.log('[Store] tool_call_start:', data.tool, data.step);
+            streamState.toolCalls.push({
+              tool: data.tool,
+              agent_id: data.agent_id,
+              step: data.step,
+              status: 'running',
+              params: data.params,
+              start_time: new Date().toISOString()
+            });
+            
+          } else if (data.type === 'tool_call_end') {
+            // 工具调用结束
+            console.log('[Store] tool_call_end:', data.tool, data.status);
+            // 更新最后一个工具调用的状态
+            if (streamState.toolCalls.length > 0) {
+              const lastToolCall = streamState.toolCalls[streamState.toolCalls.length - 1];
+              lastToolCall.status = data.status;
+              lastToolCall.result = data.result;
+              lastToolCall.duration = data.duration;
+              lastToolCall.end_time = new Date().toISOString();
+            }
             
           } else if (data.type === 'agent_update') {
             console.log('[Store] agent_update:', data.agent_id);

@@ -1,8 +1,11 @@
 import React, { useState } from 'react';
 import { marked } from 'marked';
+import SupervisorThoughtCard from './SupervisorThoughtCard';
+import TaskPlanCard from './TaskPlanCard';
 
 const MessageBubble = ({ message }) => {
   const [showThinking, setShowThinking] = useState(true);
+  const [displayedContent, setDisplayedContent] = useState('');
   const isUser = message.role === 'user';
   
   // 调试日志
@@ -17,13 +20,36 @@ const MessageBubble = ({ message }) => {
   // 处理空内容或 undefined（关键修复）
   const content = message.content || '';
   
-  // 关键修复：只有 streaming 状态且内容为空时才显示"加载中..."
-  const displayContent = content.trim() === '' && !isUser && (message.status === 'streaming' || message.status === 'thinking')
-    ? '加载中...'
-    : content;
+  // 打字机效果：流式输出最终答案
+  React.useEffect(() => {
+    if (!content || isUser) {
+      setDisplayedContent(content);
+      return;
+    }
+    
+    // 如果是流式状态，逐字显示
+    if (message.status === 'streaming') {
+      let currentIndex = 0;
+      const interval = setInterval(() => {
+        if (currentIndex < content.length) {
+          // 每次显示 1-3 个字符（中文环境下更自然）
+          const chunkSize = Math.min(3, content.length - currentIndex);
+          currentIndex += chunkSize;
+          setDisplayedContent(content.substring(0, currentIndex));
+        } else {
+          clearInterval(interval);
+        }
+      }, 20); // 20ms 显示一次，约 50 字/秒
+      
+      return () => clearInterval(interval);
+    } else {
+      // 已完成状态，直接显示全部内容
+      setDisplayedContent(content);
+    }
+  }, [content, message.status, isUser]);
   
-  // 开发环境：显示调试信息
-  const isDevelopment = process.env.NODE_ENV === 'development';
+  // 计算已完成的步骤数（用于任务规划进度）
+  const completedSteps = message.thinking_process?.length || 0;
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -40,6 +66,19 @@ const MessageBubble = ({ message }) => {
             : 'bg-white border border-gray-200 rounded-bl-none'
         }`}
       >
+        {/* 主智能体思考过程（新增） */}
+        {!isUser && message.supervisor_thoughts && message.supervisor_thoughts.length > 0 && (
+          <SupervisorThoughtCard thoughts={message.supervisor_thoughts} />
+        )}
+        
+        {/* 任务规划卡片（新增） */}
+        {!isUser && message.task_plan && (
+          <TaskPlanCard 
+            taskPlan={message.task_plan} 
+            completedSteps={completedSteps}
+          />
+        )}
+        
         {/* 思考过程（仅 AI 消息且存在思考日志时） */}
         {!isUser && message.thinking_process && message.thinking_process.length > 0 && (
           <div className="mb-4 bg-gray-50 border border-gray-200 rounded-lg p-4">
@@ -77,8 +116,13 @@ const MessageBubble = ({ message }) => {
           className={`prose prose-sm max-w-none ${
             isUser ? 'text-white' : 'text-gray-800'
           }`}
-          dangerouslySetInnerHTML={{ __html: marked(displayContent) }}
+          dangerouslySetInnerHTML={{ __html: marked(displayedContent) }}
         />
+        
+        {/* 流式光标（仅 streaming 状态） */}
+        {message.status === 'streaming' && !isUser && (
+          <span className="inline-block w-2 h-5 bg-blue-500 ml-1 animate-pulse"></span>
+        )}
         
         {/* 调试信息（仅开发环境） */}
         {process.env.NODE_ENV === 'development' && !isUser && (

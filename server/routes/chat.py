@@ -107,12 +107,30 @@ async def send_message(
             print(f"[SSE] ⚠️ 关键：ai_message.id = {ai_message.id}")
             yield f"event: session_info\ndata: {session_info_data}\n\n"
             
+            # 关键新增：主智能体开始思考
+            thought_event = json.dumps({
+                'type': 'supervisor_thought',
+                'action': 'analyzing_query',
+                'message': '正在理解用户查询...'
+            })
+            yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
+            await asyncio.sleep(0.3)
+            
             # 执行智能体任务（传入 LLM 客户端）
             task_result = await supervisor.execute(query, llm_client=llm_client)
             print(f"[SSE] 任务执行完成，类型：{task_result.get('is_simple')}")
             
             # 如果是简单任务
             if task_result.get("is_simple"):
+                # 主智能体决策
+                decision_event = json.dumps({
+                    'type': 'supervisor_decision',
+                    'decision': 'simple_task',
+                    'message': '这是一个简单任务，直接回答...'
+                })
+                yield f"event: supervisor_decision\ndata: {decision_event}\n\n"
+                await asyncio.sleep(0.3)
+                
                 yield f"event: agent_update\ndata: {json.dumps({'type': 'agent_update', 'agent': 'supervisor', 'status': 'thinking', 'message': '正在思考...'})}\n\n"
                 await asyncio.sleep(0.5)
                 
@@ -141,16 +159,31 @@ async def send_message(
                 # 复杂任务：多智能体协作
                 print(f"[Chat] 开始多智能体编排，子智能体数量：{len(task_result['sub_agents'])}")
                 
-                # 发送任务规划
-                event_data = json.dumps({
-                    'type': 'agent_update',
-                    'agent': 'supervisor',
-                    'status': 'planning',
-                    'message': f'分析任务复杂度，创建{len(task_result["sub_agents"])}个子智能体...',
-                    'intent': task_result['intent'],
-                    'sub_tasks': [sa['task'] for sa in task_result['sub_agents']]
+                # 主智能体决策：任务拆解
+                decision_event = json.dumps({
+                    'type': 'supervisor_decision',
+                    'decision': 'complex_task',
+                    'message': f'这是一个复杂任务，需要{len(task_result["sub_agents"])}个子智能体协作',
+                    'reasoning': task_result.get('intent', {}).get('reasoning', '')
                 })
-                yield f"event: agent_update\ndata: {event_data}\n\n"
+                yield f"event: supervisor_decision\ndata: {decision_event}\n\n"
+                await asyncio.sleep(0.5)
+                
+                # 发送任务规划（渐进式展示）
+                task_plan_event = json.dumps({
+                    'type': 'task_plan',
+                    'total_steps': len(task_result['sub_agents']),
+                    'steps': [
+                        {
+                            'step': i + 1,
+                            'role': sa['role'],
+                            'task': sa['task'],
+                            'status': 'pending'
+                        }
+                        for i, sa in enumerate(task_result['sub_agents'])
+                    ]
+                })
+                yield f"event: task_plan\ndata: {task_plan_event}\n\n"
                 await asyncio.sleep(0.5)
                 
                 thinking_process = []
@@ -158,9 +191,20 @@ async def send_message(
                 tool_call_count = 0
                 
                 # 关键修复：逐个执行子智能体并实时发送 SSE 事件
-                for sub_agent in task_result["sub_agents"]:
+                for idx, sub_agent in enumerate(task_result["sub_agents"]):
                     agent_id = sub_agent.get("id") or sub_agent.get("agent_id")
                     role = sub_agent["role"]
+                    
+                    # 主智能体宣布开始执行这一步
+                    thought_event = json.dumps({
+                        'type': 'supervisor_thought',
+                        'action': 'starting_step',
+                        'step': idx + 1,
+                        'total': len(task_result['sub_agents']),
+                        'message': f'开始执行第{idx + 1}步：{role} - {sub_agent["task"][:30]}...'
+                    })
+                    yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
+                    await asyncio.sleep(0.3)
                     
                     # 智能体启动事件
                     event_data = json.dumps({
@@ -176,28 +220,30 @@ async def send_message(
                     
                     # 工具调用开始（如果有真实工具）
                     if sub_agent.get('tools'):
-                        event_data = json.dumps({
+                        tool_start_event = json.dumps({
                             'type': 'tool_call_start',
                             'tool': sub_agent['tools'][0],
                             'agent_id': agent_id,
-                            'params': {'query': sub_agent['task']}
+                            'params': {'query': sub_agent['task']},
+                            'step': idx + 1
                         })
-                        yield f"event: tool_call_start\ndata: {event_data}\n\n"
+                        yield f"event: tool_call_start\ndata: {tool_start_event}\n\n"
                     
                     # 等待子智能体执行完成
                     await asyncio.sleep(0.5)
                     
                     # 工具调用结果
                     if sub_agent.get('tools'):
-                        event_data = json.dumps({
-                            'type': 'tool_call_result',
+                        tool_end_event = json.dumps({
+                            'type': 'tool_call_end',
                             'tool': sub_agent['tools'][0],
                             'agent_id': agent_id,
                             'status': 'success',
                             'result': '找到相关信息',
-                            'duration': sub_agent.get("duration", 1.0)
+                            'duration': sub_agent.get("duration", 1.0),
+                            'step': idx + 1
                         })
-                        yield f"event: tool_call_result\ndata: {event_data}\n\n"
+                        yield f"event: tool_call_end\ndata: {tool_end_event}\n\n"
                         tool_call_count += 1
                     
                     # 智能体完成
@@ -212,6 +258,16 @@ async def send_message(
                         'duration': sub_agent.get("duration", 1.0)
                     })
                     yield f"event: agent_update\ndata: {event_data}\n\n"
+                    
+                    # 主智能体评估完成
+                    thought_event = json.dumps({
+                        'type': 'supervisor_thought',
+                        'action': 'step_completed',
+                        'step': idx + 1,
+                        'message': f'第{idx + 1}步完成，耗时{sub_agent.get("duration", 1.0):.1f}秒，检查结果质量...'
+                    })
+                    yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
+                    await asyncio.sleep(0.3)
                     
                     thinking_process.append({
                         "agent": role,
@@ -230,6 +286,15 @@ async def send_message(
                         "tool_calls": sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
                         "duration": sub_agent.get("duration", 1.0)
                     })
+                
+                # 所有子智能体完成后，主智能体汇总
+                thought_event = json.dumps({
+                    'type': 'supervisor_thought',
+                    'action': 'aggregating',
+                    'message': f'所有{len(sub_agent_results)}个子智能体已完成，正在汇总结果...'
+                })
+                yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
+                await asyncio.sleep(0.5)
                 
                 # 所有子智能体完成后，主智能体汇总
                 event_data = json.dumps({
