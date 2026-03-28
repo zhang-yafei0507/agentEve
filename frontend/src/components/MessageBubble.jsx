@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { marked } from 'marked';
 import SupervisorThoughtCard from './SupervisorThoughtCard';
 import TaskPlanCard from './TaskPlanCard';
+import ToolCallCard from './ToolCallCard';
 
 const MessageBubble = ({ message }) => {
   const [showThinking, setShowThinking] = useState(true);
@@ -77,6 +78,19 @@ const MessageBubble = ({ message }) => {
             taskPlan={message.task_plan} 
             completedSteps={completedSteps}
           />
+        )}
+        
+        {/* 工具调用卡片（新增） */}
+        {!isUser && message.tool_calls && message.tool_calls.length > 0 && (
+          <div className="mb-4">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-lg">🛠️</span>
+              <span className="font-medium text-gray-700">工具调用 ({message.tool_calls.length})</span>
+            </div>
+            {message.tool_calls.map((toolCall, index) => (
+              <ToolCallCard key={index} toolCall={toolCall} />
+            ))}
+          </div>
         )}
         
         {/* 思考过程（仅 AI 消息且存在思考日志时） */}

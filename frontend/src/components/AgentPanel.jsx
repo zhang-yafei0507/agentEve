@@ -5,10 +5,19 @@ const AgentPanel = ({ onClose }) => {
   // 关键修复：使用选择器来获取状态
   const activeAgents = useStore((state) => state.activeAgents);
   const sharedBoard = useStore((state) => state.sharedBoard);
+  const currentMessageId = useStore((state) => state.currentMessageId);
+  const messages = useStore((state) => state.messages);
   
   // 从 activeAgents 中提取主智能体信息（如果有）
   const supervisorAgent = activeAgents?.find(a => a.agent === 'supervisor');
   const subAgents = activeAgents?.filter(a => a.agent !== 'supervisor') || [];
+  
+  // 关键修复：如果当前有正在流式的消息，优先显示该消息的智能体状态
+  // 否则显示最后一条完成的消息的智能体状态
+  const currentStreamingMessage = messages.find(m => m.id === currentMessageId && m.status === 'streaming');
+  const lastCompletedMessageWithAgents = messages.filter(
+    m => m.role === 'assistant' && m.sub_agent_results && m.sub_agent_results.length > 0
+  ).pop();
 
   return (
     <div className="w-80 bg-white border-l border-gray-200 flex flex-col h-full">
@@ -36,6 +45,18 @@ const AgentPanel = ({ onClose }) => {
       {/* 执行流程图 */}
       <div className="flex-1 overflow-y-auto p-4">
         <h3 className="text-sm font-medium text-gray-700 mb-3">🔄 执行流程</h3>
+        
+        {/* 提示当前显示的状态来源 */}
+        {currentStreamingMessage && (
+          <div className="mb-3 text-xs bg-blue-50 border border-blue-200 rounded p-2 text-blue-700">
+            📊 显示实时流式状态 (消息 ID: {currentStreamingMessage.id.substring(0, 8)}...)
+          </div>
+        )}
+        {!currentStreamingMessage && lastCompletedMessageWithAgents && (
+          <div className="mb-3 text-xs bg-gray-50 border border-gray-200 rounded p-2 text-gray-600">
+            📋 显示最近完成的智能体协作 (消息 ID: {lastCompletedMessageWithAgents.id.substring(0, 8)}...)
+          </div>
+        )}
         
         <div className="space-y-4">
           {/* 主智能体 */}

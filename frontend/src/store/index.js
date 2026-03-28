@@ -7,8 +7,9 @@ export const useStore = create((set, get) => ({
   currentSessionId: null,
   messages: [],
   
-  // 智能体协作状态
+  // 智能体协作状态（关键修复：与当前消息绑定）
   activeAgents: [],
+  currentMessageId: null, // 跟踪当前正在流式传输的消息 ID
   sharedBoard: {
     key_findings: [],
     intermediate_conclusions: [],
@@ -201,8 +202,10 @@ export const useStore = create((set, get) => ({
       supervisorThoughts: [],
       // 新增：任务规划
       taskPlan: null,
-      // 新增：工具调用记录
-      toolCalls: []
+      // 新增：工具调用记录（独立存储）
+      toolCalls: [],
+      // 新增：任务步骤状态（用于渐进式更新）
+      taskSteps: []
     };
     
     try {
@@ -269,11 +272,17 @@ export const useStore = create((set, get) => ({
             });
             
           } else if (data.type === 'task_plan') {
-            // 新增：任务规划
+            // 新增：任务规划（支持渐进式更新）
             console.log('[Store] task_plan:', data.total_steps, 'steps');
+            
+            // 初始化步骤状态
             streamState.taskPlan = {
               total_steps: data.total_steps,
-              steps: data.steps || [],
+              steps: (data.steps || []).map(step => ({
+                ...step,
+                status: step.status || 'pending',
+                revealed: step.revealed !== undefined ? step.revealed : true
+              })),
               timestamp: new Date().toISOString()
             };
             
@@ -295,33 +304,163 @@ export const useStore = create((set, get) => ({
               return prevState;
             });
             
+          } else if (data.type === 'task_plan_update') {
+            // 新增：任务规划更新（逐步揭示步骤）
+            console.log('[Store] task_plan_update:', data.new_step);
+            if (streamState.taskPlan && data.new_step) {
+              // 添加新揭示的步骤
+              streamState.taskPlan.steps.push({
+                ...data.new_step,
+                revealed: true
+              });
+              
+              // 实时更新消息中的任务规划
+              set(prevState => {
+                const existingMsgIndex = prevState.messages.findIndex(
+                  m => m.id === streamState.aiMessageId
+                );
+                
+                if (existingMsgIndex >= 0) {
+                  const newMessages = [...prevState.messages];
+                  newMessages[existingMsgIndex] = {
+                    ...newMessages[existingMsgIndex],
+                    task_plan: { ...streamState.taskPlan },
+                    status: 'streaming'
+                  };
+                  return { messages: newMessages };
+                }
+                return prevState;
+              });
+            }
+            
           } else if (data.type === 'tool_call_start') {
-            // 工具调用开始
+            // 工具调用开始 - 创建新的工具调用记录
             console.log('[Store] tool_call_start:', data.tool, data.step);
-            streamState.toolCalls.push({
+            const newToolCall = {
               tool: data.tool,
               agent_id: data.agent_id,
               step: data.step,
               status: 'running',
-              params: data.params,
-              start_time: new Date().toISOString()
+              params: data.params || {},
+              start_time: new Date().toISOString(),
+              result: null,
+              duration: 0
+            };
+            streamState.toolCalls.push(newToolCall);
+            
+            // 实时更新消息中的工具调用列表
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+              
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  tool_calls: [...streamState.toolCalls],
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
             });
             
           } else if (data.type === 'tool_call_end') {
-            // 工具调用结束
+            // 工具调用结束 - 更新最后一个工具调用的状态
             console.log('[Store] tool_call_end:', data.tool, data.status);
-            // 更新最后一个工具调用的状态
             if (streamState.toolCalls.length > 0) {
               const lastToolCall = streamState.toolCalls[streamState.toolCalls.length - 1];
               lastToolCall.status = data.status;
               lastToolCall.result = data.result;
               lastToolCall.duration = data.duration;
               lastToolCall.end_time = new Date().toISOString();
+              
+              // 实时更新消息中的工具调用列表
+              set(prevState => {
+                const existingMsgIndex = prevState.messages.findIndex(
+                  m => m.id === streamState.aiMessageId
+                );
+                
+                if (existingMsgIndex >= 0) {
+                  const newMessages = [...prevState.messages];
+                  newMessages[existingMsgIndex] = {
+                    ...newMessages[existingMsgIndex],
+                    tool_calls: [...streamState.toolCalls],
+                    status: 'streaming'
+                  };
+                  return { messages: newMessages };
+                }
+                return prevState;
+              });
             }
-            
+                      
+          } else if (data.type === 'next_step_decision') {
+            // 新增：下一步决策事件
+            console.log('[Store] next_step_decision:', data.message);
+            streamState.supervisorThoughts.push({
+              type: 'next_step',
+              current_step: data.current_step,
+              message: data.message,
+              timestamp: new Date().toISOString()
+            });
+                      
+            // 实时更新消息中的思考过程
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+                        
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  supervisor_thoughts: [...streamState.supervisorThoughts],
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
+            });
+                      
+          } else if (data.type === 'supervisor_reflecting') {
+            // 新增：主智能体反思事件
+            console.log('[Store] supervisor_reflecting:', data.message);
+            streamState.supervisorThoughts.push({
+              type: 'reflecting',
+              action: 'reflecting',
+              step: data.step,
+              message: data.message,
+              timestamp: new Date().toISOString()
+            });
+                      
+            // 实时更新消息中的思考过程
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+                        
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  supervisor_thoughts: [...streamState.supervisorThoughts],
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
+            });
           } else if (data.type === 'agent_update') {
             console.log('[Store] agent_update:', data.agent_id);
+            
+            // 关键修复：同时更新全局 activeAgents 和当前消息的智能体状态
             get().updateAgentState(data);
+            
+            // 记录当前消息 ID，确保智能体状态与该消息绑定
+            if (streamState.aiMessageId) {
+              streamState.currentMessageId = streamState.aiMessageId;
+            }
             
             // 关键修复：实时累积思考过程和子智能体结果
             if (data.status === 'completed' && data.output) {
@@ -349,10 +488,6 @@ export const useStore = create((set, get) => ({
                 sub_agent_results: streamState.subAgentResults.length
               });
             }
-            
-          } else if (data.type === 'tool_call_start' || data.type === 'tool_call_result') {
-            // 工具调用事件
-            console.log('[Store] 工具调用:', data.tool_name);
             
           } else if (data.type === 'final_answer_chunk') {
             // 答案片段 - 累积内容（关键修复）

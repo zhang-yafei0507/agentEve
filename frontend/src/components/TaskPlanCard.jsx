@@ -11,6 +11,9 @@ const TaskPlanCard = ({ taskPlan, completedSteps = 0 }) => {
 
   const totalSteps = taskPlan.total_steps || taskPlan.steps.length;
   const progress = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+  
+  // 关键修复：支持逐步揭示步骤
+  const revealedSteps = taskPlan.steps.filter(step => step.revealed !== false || step.status === 'completed');
 
   return (
     <div className="mb-4 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg overflow-hidden">
@@ -46,8 +49,13 @@ const TaskPlanCard = ({ taskPlan, completedSteps = 0 }) => {
       {isExpanded && (
         <div className="p-4 space-y-3">
           {taskPlan.steps.map((step, index) => {
-            const isCompleted = index < completedSteps;
-            const isCurrent = index === completedSteps;
+            // 关键修复：只有已揭示的步骤才显示
+            if (step.revealed === false && step.status !== 'completed') {
+              return null;
+            }
+            
+            const isCompleted = index < completedSteps || step.status === 'completed';
+            const isCurrent = index === completedSteps || step.status === 'running';
             
             return (
               <div
