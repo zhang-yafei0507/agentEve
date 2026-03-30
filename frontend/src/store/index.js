@@ -7,15 +7,9 @@ export const useStore = create((set, get) => ({
   currentSessionId: null,
   messages: [],
   
-  // 智能体协作状态（关键修复：与当前消息绑定）
+  // 智能体协作状态（已重构：与当前消息绑定）
   activeAgents: [],
   currentMessageId: null, // 跟踪当前正在流式传输的消息 ID
-  sharedBoard: {
-    key_findings: [],
-    intermediate_conclusions: [],
-    open_questions: [],
-    help_requests: []
-  },
   
   // 工具相关
   tools: [],
@@ -87,36 +81,29 @@ export const useStore = create((set, get) => ({
       set({
         currentSessionId: sessionId,
         messages: (data.messages || []).map(msg => {
-          // 关键修复：确保 AI 消息有正确的 status
+          // 新架构：确保 AI 消息有正确的 status 和结构化数据
           if (msg.role === 'assistant') {
             return {
               ...msg,
               status: msg.status || 'completed', // 默认完成状态
+              // 从 msg_metadata 中提取或兼容旧字段
+              supervisor_thoughts: msg.msg_metadata?.supervisor_thoughts || msg.thinking_process || [],
+              reflections: msg.msg_metadata?.reflections || [],
+              tool_calls: msg.msg_metadata?.tool_calls || [],
+              // 已废弃但保留兼容性
               thinking_process: msg.thinking_process || [],
-              sub_agent_results: msg.sub_agent_results || [],
-              citations: msg.citations || []
+              sub_agent_results: msg.sub_agent_results || []
             };
           }
           return msg;
         })
       });
       
-      // 关键修复：恢复最后一条 AI 消息的智能体状态到右侧面板
-      const lastAiMessage = data.messages?.find(m => m.role === 'assistant' && m.sub_agent_results && m.sub_agent_results.length > 0);
-      if (lastAiMessage && lastAiMessage.sub_agent_results) {
-        console.log('[Store] 恢复智能体状态 from history:', lastAiMessage.sub_agent_results.length, 'agents');
-        // 将子智能体结果恢复到 activeAgents
-        lastAiMessage.sub_agent_results.forEach(agentResult => {
-          get().updateAgentState({
-            agent_id: agentResult.agent_id,
-            role: agentResult.role,
-            status: 'completed',
-            message: agentResult.output,
-            task: agentResult.task,
-            duration: agentResult.duration,
-            tool_calls: agentResult.tool_calls
-          });
-        });
+      // 关键修复：恢复最后一条 AI 消息的智能体状态到右侧面板（兼容性保留）
+      const lastAiMessage = data.messages?.find(m => m.role === 'assistant' && m.supervisor_thoughts && m.supervisor_thoughts.length > 0);
+      if (lastAiMessage && lastAiMessage.supervisor_thoughts) {
+        console.log('[Store] 恢复智能体状态 from history:', lastAiMessage.supervisor_thoughts.length, '步思考');
+        // 不再恢复到 activeAgents，因为新架构使用 supervisor_thoughts 直接展示
       }
     } catch (error) {
       console.error('[Store] 加载历史失败:', error);
@@ -190,22 +177,17 @@ export const useStore = create((set, get) => ({
       return;
     }
     
-    // 使用 Ref 模式维护流式状态（关键修复）
+    // 使用 Ref 模式维护流式状态（新架构）
     const streamState = {
       aiMessageId: null,
       accumulatedContent: '',
       messageCreated: false,
-      // 关键修复：实时累积结构化数据
-      thinkingProcess: [],
-      subAgentResults: [],
-      // 新增：主智能体思考过程
-      supervisorThoughts: [],
-      // 新增：任务规划
-      taskPlan: null,
-      // 新增：工具调用记录（独立存储）
-      toolCalls: [],
-      // 新增：任务步骤状态（用于渐进式更新）
-      taskSteps: []
+      // 新架构：使用 supervisor_thoughts, tool_calls, reflections
+      supervisorThoughts: [],  // 主智能体思考
+      taskPlan: null,          // 任务规划
+      toolCalls: [],           // 工具调用记录
+      reflections: [],         // 反思历史
+      taskSteps: []            // 任务步骤状态
     };
     
     try {
@@ -451,44 +433,49 @@ export const useStore = create((set, get) => ({
               }
               return prevState;
             });
+          } else if (data.type === 'reflection') {
+            // 新增：反思事件 - ReAct 循环的核心
+            console.log('[Store] 🤔 reflection:', data.quality_score, data.observation_summary);
+            streamState.reflections.push({
+              step: data.step || 0,
+              quality_score: data.quality_score || 0,
+              observation_summary: data.observation_summary || '',
+              adjustment: data.adjustment || '',
+              should_continue: data.should_continue || false,
+              should_finish: data.should_finish || false,
+              timestamp: new Date().toISOString()
+            });
+            
+            // 实时更新消息中的反思历史
+            set(prevState => {
+              const existingMsgIndex = prevState.messages.findIndex(
+                m => m.id === streamState.aiMessageId
+              );
+              
+              if (existingMsgIndex >= 0) {
+                const newMessages = [...prevState.messages];
+                newMessages[existingMsgIndex] = {
+                  ...newMessages[existingMsgIndex],
+                  reflections: [...streamState.reflections],
+                  status: 'streaming'
+                };
+                return { messages: newMessages };
+              }
+              return prevState;
+            });
           } else if (data.type === 'agent_update') {
             console.log('[Store] agent_update:', data.agent_id);
             
-            // 关键修复：同时更新全局 activeAgents 和当前消息的智能体状态
+            // 更新全局 activeAgents（兼容性保留）
             get().updateAgentState(data);
             
-            // 记录当前消息 ID，确保智能体状态与该消息绑定
+            // 记录当前消息 ID
             if (streamState.aiMessageId) {
               streamState.currentMessageId = streamState.aiMessageId;
             }
             
-            // 关键修复：实时累积思考过程和子智能体结果
-            if (data.status === 'completed' && data.output) {
-              // 添加到 thinking_process
-              streamState.thinkingProcess.push({
-                agent: data.agent || data.role,
-                action: data.task || '',
-                tool_calls: data.tool_calls || 0,
-                duration: data.duration || 0,
-                timestamp: new Date().toISOString()
-              });
-              
-              // 添加到 sub_agent_results
-              streamState.subAgentResults.push({
-                agent_id: data.agent_id,
-                role: data.agent || data.role,
-                task: data.task,
-                output: data.output,
-                tool_calls: data.tool_calls || 0,
-                duration: data.duration || 0
-              });
-              
-              console.log('[Store] ✅ 累积结构化数据:', {
-                thinking_process: streamState.thinkingProcess.length,
-                sub_agent_results: streamState.subAgentResults.length
-              });
-            }
-            
+            // 已移除：不再累积 thinking_process 和 sub_agent_results
+            // 新架构使用 supervisor_thoughts + reflections + tool_calls
           } else if (data.type === 'final_answer_chunk') {
             // 答案片段 - 累积内容（关键修复）
             const chunk = data.chunk || '';
@@ -519,9 +506,10 @@ export const useStore = create((set, get) => ({
                   ...newMessages[existingMsgIndex],
                   content: streamState.accumulatedContent,
                   status: 'streaming',
-                  // 关键修复：实时更新结构化字段
-                  thinking_process: [...streamState.thinkingProcess],
-                  sub_agent_results: [...streamState.subAgentResults]
+                  // 新架构：使用 supervisor_thoughts, reflections, tool_calls
+                  supervisor_thoughts: [...streamState.supervisorThoughts],
+                  reflections: [...streamState.reflections],
+                  tool_calls: [...streamState.toolCalls]
                 };
                 console.log('[Store] ✅ 成功更新消息内容和结构化数据');
                 return { messages: newMessages };
@@ -535,8 +523,9 @@ export const useStore = create((set, get) => ({
                       id: streamState.aiMessageId,
                       role: 'assistant',
                       content: streamState.accumulatedContent,
-                      thinking_process: [...streamState.thinkingProcess],
-                      sub_agent_results: [...streamState.subAgentResults],
+                      supervisor_thoughts: [...streamState.supervisorThoughts],
+                      reflections: [...streamState.reflections],
+                      tool_calls: [...streamState.toolCalls],
                       citations: [],
                       status: 'streaming',
                       timestamp: new Date().toISOString()
@@ -591,7 +580,7 @@ export const useStore = create((set, get) => ({
     }
   },
   
-  // 更新智能体状态
+  // 更新智能体状态（已重构，移除 sharedBoard）
   updateAgentState: (agentUpdate) => {
     console.log('[Store] updateAgentState:', agentUpdate);
     set(state => {
@@ -630,15 +619,7 @@ export const useStore = create((set, get) => ({
     });
   },
   
-  // 更新共享状态板
-  updateSharedBoard: (update) => {
-    set(state => ({
-      sharedBoard: {
-        ...state.sharedBoard,
-        ...update
-      }
-    }));
-  },
+  // 已移除：updateSharedBoard（新架构不再需要）
   
   // 加载工具列表
   loadTools: async () => {

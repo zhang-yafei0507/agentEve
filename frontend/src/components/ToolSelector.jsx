@@ -76,14 +76,14 @@ const ToolSelector = ({ isOpen, onClose }) => {
   return (
     <Dialog open={isOpen} onClose={onClose} className="fixed inset-0 z-50 overflow-y-auto">
       <div className="flex items-center justify-center min-h-screen px-4">
-        <Dialog.Overlay className="fixed inset-0 bg-black opacity-30" />
+        <div className="fixed inset-0 bg-black opacity-30" />
 
         <div className="bg-white rounded-lg max-w-4xl w-full max-h-[600px] flex flex-col relative z-10 shadow-xl">
           {/* 标题栏 */}
           <div className="p-6 border-b flex items-center justify-between">
-            <Dialog.Title className="text-xl font-bold text-gray-800">
+            <h2 className="text-xl font-bold text-gray-800">
               🛠️ 选择工具
-            </Dialog.Title>
+            </h2>
             <button 
               onClick={onClose} 
               className="text-gray-400 hover:text-gray-600 transition-colors"

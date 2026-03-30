@@ -38,12 +38,12 @@ class MCPClient:
         self.tools: List[Dict] = []
         self.is_connected = False
         
-    async def connect(self):
-        """连接到 MCP 服务器"""
+    async def connect(self, max_retries: int = 3, timeout: int = 30):
+        """连接到 MCP 服务器（增强版：带重试和超时）"""
         if not MCP_SDK_AVAILABLE:
             # 模拟连接（降级方案）
             print(f"[MCP] 📡 模拟连接到 {self.config.get('name', 'unknown')}")
-            await asyncio.sleep(1)  # 模拟延迟
+            await asyncio.sleep(0.5)  # 模拟延迟
             
             # 模拟发现工具
             self.tools = [
@@ -64,66 +64,95 @@ class MCPClient:
             self.is_connected = True
             return
         
-        try:
-            print(f"[MCP] 🔌 正在连接 MCP 服务器：{self.config.get('name')}")
-            
-            if self.connection_type == "stdio":
-                # stdio 连接
-                command_parts = self.config.get("command", "").split()
-                if not command_parts:
-                    raise ValueError("stdio 连接需要提供启动命令")
+        # 重试机制
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                print(f"[MCP] 🔌 正在连接 MCP 服务器：{self.config.get('name')} (尝试 {attempt + 1}/{max_retries})")
                 
-                params = StdioServerParameters(
-                    command=command_parts[0],
-                    args=command_parts[1:],
-                    env=self.config.get("env_vars", {})
+                if self.connection_type == "stdio":
+                    # stdio 连接
+                    command_parts = self.config.get("command", "").split()
+                    if not command_parts:
+                        raise ValueError("stdio 连接需要提供启动命令")
+                    
+                    params = StdioServerParameters(
+                        command=command_parts[0],
+                        args=command_parts[1:],
+                        env=self.config.get("env_vars", {})
+                    )
+                    
+                    print(f"[MCP] 启动命令：{params.command} {' '.join(params.args)}")
+                    transport = await asyncio.wait_for(
+                        stdio_client(params).__aenter__(),
+                        timeout=timeout
+                    )
+                    
+                elif self.connection_type == "sse":
+                    # SSE 连接
+                    url = self.config.get("url")
+                    if not url:
+                        raise ValueError("SSE 连接需要提供 URL")
+                    
+                    print(f"[MCP] SSE 地址：{url}")
+                    transport = await asyncio.wait_for(
+                        sse_client(url).__aenter__(),
+                        timeout=timeout
+                    )
+                    
+                elif self.connection_type == "websocket":
+                    # WebSocket 连接（TODO: 待实现）
+                    raise NotImplementedError("WebSocket 连接暂不支持")
+                    
+                else:
+                    raise ValueError(f"不支持的连接类型：{self.connection_type}")
+                
+                # 获取读写流
+                reader, writer = transport
+                
+                # 创建并初始化会话
+                self.session = ClientSession(reader, writer)
+                await asyncio.wait_for(
+                    self.session.initialize(),
+                    timeout=timeout
                 )
                 
-                print(f"[MCP] 启动命令：{params.command} {' '.join(params.args)}")
-                transport = await stdio_client(params).__aenter__()
+                # 获取工具列表
+                response = await self.session.list_tools()
+                self.tools = response.tools or []
                 
-            elif self.connection_type == "sse":
-                # SSE 连接
-                url = self.config.get("url")
-                if not url:
-                    raise ValueError("SSE 连接需要提供 URL")
+                self.is_connected = True
+                print(f"[MCP] ✅ 连接成功，发现 {len(self.tools)} 个工具")
+                return  # 成功则退出
                 
-                print(f"[MCP] SSE 地址：{url}")
-                transport = await sse_client(url).__aenter__()
+            except asyncio.TimeoutError as e:
+                last_error = e
+                print(f"[MCP] ⏰ 连接超时（{timeout}秒），准备重试...")
                 
-            elif self.connection_type == "websocket":
-                # WebSocket 连接（TODO: 待实现）
-                raise NotImplementedError("WebSocket 连接暂不支持")
+            except Exception as e:
+                last_error = e
+                print(f"[MCP] ❌ 连接失败：{e}")
                 
-            else:
-                raise ValueError(f"不支持的连接类型：{self.connection_type}")
-            
-            # 获取读写流
-            reader, writer = transport
-            
-            # 创建并初始化会话
-            self.session = ClientSession(reader, writer)
-            await self.session.initialize()
-            
-            # 获取工具列表
-            response = await self.session.list_tools()
-            self.tools = response.tools or []
-            
-            self.is_connected = True
-            print(f"[MCP] ✅ 连接成功，发现 {len(self.tools)} 个工具")
-            
-        except Exception as e:
-            print(f"[MCP] ❌ 连接失败：{e}")
-            self.is_connected = False
-            raise
+            # 指数退避
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 1.0  # 1s, 2s, 4s
+                print(f"[MCP] 等待 {wait_time:.1f}秒后重试...")
+                await asyncio.sleep(wait_time)
+        
+        # 所有重试失败
+        print(f"[MCP] ❌ 所有连接尝试失败，共{max_retries}次")
+        self.is_connected = False
+        if last_error:
+            raise last_error
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict:
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: int = 60) -> Dict:
         """
-        调用 MCP 工具
+        调用 MCP 工具（增强版：带超时和错误分类）
         
         Args:
             tool_name: 工具名称
             arguments: 工具参数
+            timeout: 执行超时（秒）
             
         Returns:
             工具执行结果
@@ -136,21 +165,46 @@ class MCPClient:
         
         try:
             print(f"[MCP] 🔧 调用工具：{tool_name}, 参数：{arguments}")
-            result = await self.session.call_tool(tool_name, arguments)
+            
+            # 参数校验
+            if tool_name not in [t.get("name") for t in self.tools]:
+                return {
+                    "success": False,
+                    "error": f"未知工具：{tool_name}",
+                    "error_type": "invalid_tool"
+                }
+            
+            # 调用工具（带超时）
+            result = await asyncio.wait_for(
+                self.session.call_tool(tool_name, arguments),
+                timeout=timeout
+            )
             
             # 转换结果为字典格式
             return {
                 "success": True,
                 "result": result.content if hasattr(result, 'content') else result,
-                "tool_name": tool_name
+                "tool_name": tool_name,
+                "error_type": None
+            }
+            
+        except asyncio.TimeoutError:
+            print(f"[MCP] ⏰ 工具调用超时：{tool_name} (超过{timeout}秒)")
+            return {
+                "success": False,
+                "error": f"工具调用超时（超过{timeout}秒）",
+                "tool_name": tool_name,
+                "error_type": "timeout"
             }
             
         except Exception as e:
-            print(f"[MCP] ❌ 工具调用失败：{tool_name}, 错误：{e}")
+            error_type = "network_error" if "connection" in str(e).lower() else "api_error"
+            print(f"[MCP] ❌ 工具调用失败：{tool_name}, 错误：{e}, 类型：{error_type}")
             return {
                 "success": False,
                 "error": str(e),
-                "tool_name": tool_name
+                "tool_name": tool_name,
+                "error_type": error_type
             }
     
     async def disconnect(self):

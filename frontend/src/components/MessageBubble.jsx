@@ -3,6 +3,9 @@ import { marked } from 'marked';
 import SupervisorThoughtCard from './SupervisorThoughtCard';
 import TaskPlanCard from './TaskPlanCard';
 import ToolCallCard from './ToolCallCard';
+// 新增：反思历史和执行统计组件
+import ReflectionTimeline from './ReflectionTimeline';
+import ExecutionStats from './ExecutionStats';
 
 const MessageBubble = ({ message }) => {
   const [showThinking, setShowThinking] = useState(true);
@@ -50,7 +53,10 @@ const MessageBubble = ({ message }) => {
   }, [content, message.status, isUser]);
   
   // 计算已完成的步骤数（用于任务规划进度）
-  const completedSteps = message.thinking_process?.length || 0;
+  const completedSteps = message.supervisor_thoughts?.length || 0;
+  
+  // 从消息中提取 reflections（新增）
+  const reflections = message.reflections || [];
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -67,64 +73,16 @@ const MessageBubble = ({ message }) => {
             : 'bg-white border border-gray-200 rounded-bl-none'
         }`}
       >
-        {/* 主智能体思考过程（新增） */}
+        {/* 思考过程卡片 - 已重构为 SupervisorThoughtCard */}
         {!isUser && message.supervisor_thoughts && message.supervisor_thoughts.length > 0 && (
           <SupervisorThoughtCard thoughts={message.supervisor_thoughts} />
         )}
-        
-        {/* 任务规划卡片（新增） */}
-        {!isUser && message.task_plan && (
-          <TaskPlanCard 
-            taskPlan={message.task_plan} 
-            completedSteps={completedSteps}
-          />
-        )}
-        
-        {/* 工具调用卡片（新增） */}
-        {!isUser && message.tool_calls && message.tool_calls.length > 0 && (
-          <div className="mb-4">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-lg">🛠️</span>
-              <span className="font-medium text-gray-700">工具调用 ({message.tool_calls.length})</span>
-            </div>
-            {message.tool_calls.map((toolCall, index) => (
-              <ToolCallCard key={index} toolCall={toolCall} />
-            ))}
-          </div>
-        )}
-        
-        {/* 思考过程（仅 AI 消息且存在思考日志时） */}
-        {!isUser && message.thinking_process && message.thinking_process.length > 0 && (
-          <div className="mb-4 bg-gray-50 border border-gray-200 rounded-lg p-4">
-            <button
-              onClick={() => setShowThinking(!showThinking)}
-              className="flex items-center justify-between w-full text-left"
-            >
-              <span className="font-medium text-gray-700">💭 思考过程 ({message.thinking_process.length} 步)</span>
-              <span className="text-gray-400">{showThinking ? '▲' : '▼'}</span>
-            </button>
-            
-            {showThinking && message.thinking_process && message.thinking_process.length > 0 && (
-              <div className="mt-3 space-y-2">
-                {message.thinking_process.map((thought, index) => (
-                  <div key={index} className="flex items-start gap-2 text-sm">
-                    <span className="text-gray-400 mt-1">{index + 1}.</span>
-                    <div className="flex-1">
-                      <div className="font-medium text-primary">{thought.agent}</div>
-                      <div className="text-gray-600">{thought.action}</div>
-                      {thought.tool_calls && (
-                        <span className="text-xs text-gray-500">
-                          (工具调用：{thought.tool_calls}次)
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
 
+        {/* 反思历史（新增） */}
+        {!isUser && reflections && reflections.length > 0 && (
+          <ReflectionTimeline reflections={reflections} />
+        )}
+        
         {/* 消息内容 */}
         <div
           className={`prose prose-sm max-w-none ${
@@ -146,26 +104,15 @@ const MessageBubble = ({ message }) => {
           </div>
         )}
 
-        {/* 子智能体结果（仅 AI 消息） */}
-        {!isUser && message.sub_agent_results && message.sub_agent_results.length > 0 && (
-          <div className="mt-4 space-y-3">
-            {message.sub_agent_results.map((agent, index) => (
-              <div
-                key={index}
-                className="bg-blue-50 border border-blue-200 rounded-lg p-3"
-              >
-                <div className="flex items-center justify-between mb-2">
-                  <h4 className="font-medium text-primary">
-                    🔹 {agent.role} 的输出
-                  </h4>
-                  <span className="text-xs text-gray-500">
-                    耗时：{agent.duration?.toFixed(1)}s
-                  </span>
-                </div>
-                <p className="text-sm text-gray-700">{agent.output}</p>
-              </div>
-            ))}
-          </div>
+        {/* 执行统计（完成后显示，新增） */}
+        {message.status === 'completed' && message.msg_metadata && (
+          <ExecutionStats stats={{
+            total_steps: message.msg_metadata.total_steps || 0,
+            successful_tool_calls: message.msg_metadata.total_tool_calls || 0,
+            failed_tool_calls: 0,
+            total_tokens: message.msg_metadata.total_tokens || 0,
+            duration: message.msg_metadata.duration || 0
+          }} />
         )}
 
         {/* 引用来源（仅 AI 消息） */}
