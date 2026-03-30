@@ -1,0 +1,1169 @@
+================================================================================
+                    通用智能体架构改造方案
+                    从场景驱动到能力驱动的核心改造
+                    (基于现有代码的精准改造版)
+================================================================================
+
+一、核心设计理念转变
+================================================================================
+
+❌ 旧理念（场景驱动）：
+   "如果是财报任务，创建 researcher+analyzer+writer"
+   "如果是旅行任务，创建 flight_finder+hotel_booker+itinerary_planner"
+   → 无限分类，无法泛化，每新场景都要开发新智能体
+
+✅ 新理念（能力驱动）：
+   "只有一个通用智能体"
+   "所有能力都通过工具/插件提供"
+   "智能体只负责：理解目标 → 规划步骤 → 调用工具 → 整合结果"
+   → 一套架构，适应所有场景，新能力只需接入新工具
+
+核心类比：
+   旧系统 = 瑞士军刀（每个场景一个专用刀片）
+   新系统 = 智能手机（一个通用设备，能力通过 APP 扩展）
+
+================================================================================
+二、当前系统核心问题（基于实际代码分析）
+================================================================================
+
+问题 1：SupervisorAgent 仍是多智能体编排模式
+--------------------------------------------------------------------------------
+现状（/workspace/server/agents/supervisor.py）：
+  - 第 573-644 行：execute() 方法创建多个 SubAgent 并行执行
+  - 第 408-545 行：decompose_task() 拆解为固定角色（Researcher/Analyzer/Writer）
+  - 第 547-560 行：create_sub_agents() 为每个子任务创建独立智能体实例
+  - 第 620-623 行：asyncio.gather() 并行执行所有子智能体
+
+问题：
+  ✗ 本质仍是"多专家协作"模式，非单一通用智能体
+  ✗ 角色预定义在 AGENT_PROMPTS（第 22-67 行），无法动态扩展
+  ✗ 并行执行导致工具调用混乱，无法形成 ReAct 循环
+  ✗ 共享状态板（SharedBoard）增加复杂度但收益有限
+
+修改方向：
+  ✓ 废弃 SubAgent 类，只保留单一 UniversalAgent
+  ✓ 将 AGENT_PROMPTS 改为通用 System Prompt
+  ✓ 将并行执行改为串行 ReAct 循环（思考→行动→观察→反思）
+  ✓ 移除 SharedBoard，改用 ExecutionState 管理单次执行状态
+
+--------------------------------------------------------------------------------
+
+问题 2：工具调用层未真正集成 MCP 协议
+--------------------------------------------------------------------------------
+现状：
+  - /workspace/server/tools/web_search.py：独立实现搜索工具，未走 MCP
+  - /workspace/server/mcp/client.py：MCPClient 仅支持模拟模式（第 43-65 行）
+  - /workspace/server/core/orchestrator.py：第 148-192 行直接调用 get_tool()
+  - 工具注册硬编码在 routes/tools.py，未实现动态发现
+
+问题：
+  ✗ MCP SDK 未安装时降级为模拟工具（第 18 行警告）
+  ✗ 真实工具（web_search）与 MCP 工具割裂，无统一接口
+  ✗ 工具调用未经过 MCP 协议标准化，无法热插拔
+  ✗ 缺少工具调用日志和审计机制
+
+修改方向：
+  ✓ 统一所有工具通过 MCPClient.call_tool() 调用
+  ✓ 将 web_search 等内置工具封装为 MCP Server
+  ✓ 实现工具动态发现和注册机制
+  ✓ 添加工具调用成功率监控
+
+--------------------------------------------------------------------------------
+
+问题 3：Orchestrator 是伪流式，非真正 ReAct 循环
+--------------------------------------------------------------------------------
+现状（/workspace/server/core/orchestrator.py）：
+  - 第 93-254 行：for 循环遍历预定义的 sub_agents
+  - 第 194-195 行：使用 asyncio.sleep(0.5) 模拟执行时间
+  - 第 198 行：output = sub_agent.get("output", f"已完成任务...") 直接使用预设输出
+  - 第 278-298 行：最后一步才调用 LLM 生成最终答案
+
+问题：
+  ✗ 执行步骤在执行前已确定（sub_agents 列表），无法动态调整
+  ✗ 子智能体输出是预设的，非真实 LLM 调用
+  ✗ 缺少"观察 - 反思"环节，无法根据中间结果调整策略
+  ✗ 工具调用失败时无备选方案
+
+修改方向：
+  ✓ 将 for 循环改为 while 循环（while not is_completed and step < max_steps）
+  ✓ 每一步都调用 LLM 决定下一步行动（think() 方法）
+  ✓ 添加 reflect() 方法评估执行质量
+  ✓ 支持动态插入新步骤或跳过无效步骤
+
+--------------------------------------------------------------------------------
+
+问题 4：SSE 事件类型不足，前端展示受限
+--------------------------------------------------------------------------------
+现状：
+  - 后端支持的事件类型（orchestrator.py）：
+    * supervisor_thought, supervisor_decision, supervisor_reflecting
+    * task_plan, task_plan_update
+    * agent_update, tool_call_start, tool_call_end
+    * final_answer_chunk, done
+  - 前端消息结构（MessageBubble.jsx）：
+    * supervisor_thoughts（数组）
+    * task_plan（对象）
+    * tool_calls（数组）
+    * thinking_process（数组，冗余）
+    * sub_agent_results（数组）
+
+问题：
+  ✗ 缺少 tool_call_progress 事件，长耗时工具无进度反馈
+  ✗ 缺少 reflection 事件，反思过程不可见
+  ✗ 缺少 error 事件，错误处理不透明
+  ✗ 前端数据结构冗余（thinking_process 和 supervisor_thoughts 重复）
+
+修改方向：
+  ✓ 新增 tool_call_progress 事件（每 5 秒推送一次进度）
+  ✓ 新增 reflection 事件（包含反思内容和策略调整）
+  ✓ 新增 error 事件（包含错误详情和恢复建议）
+  ✓ 简化前端数据结构，移除冗余字段
+
+--------------------------------------------------------------------------------
+
+问题 5：前端状态管理复杂，SSE 事件处理分散
+--------------------------------------------------------------------------------
+现状（/workspace/frontend/src/services/api.js）：
+  - 第 48-104 行：SSE 流解析逻辑在 api.js 中
+  - 第 84-87 行：onMessage 回调直接处理 parsed 数据
+  - MessageBubble.jsx 被动接收 message 对象，无状态更新逻辑
+
+问题：
+  ✗ SSE 事件处理逻辑在 API 层，业务逻辑耦合
+  ✗ 缺少全局状态管理（如 Zustand/Redux）追踪执行状态
+  ✗ 消息对象更新是全量替换，非增量合并
+  ✗ 刷新后无法恢复执行状态
+
+修改方向：
+  ✓ 创建 useAgentExecution Hook 统一管理 SSE 事件
+  ✓ 使用 Zustand 创建 executionStore 存储执行状态
+  ✓ 实现增量更新逻辑（merge 而非 replace）
+  ✓ 添加状态持久化（IndexedDB 保存执行历史）
+
+================================================================================
+三、需要修改的具体内容（对照现有代码）
+================================================================================
+
+3.1 后端架构改造
+--------------------------------------------------------------------------------
+
+【修改 1】重构 SupervisorAgent 为 UniversalAgent
+
+原代码位置：/workspace/server/agents/supervisor.py
+
+待删除内容：
+  - AgentRole 类（第 10-18 行）：不再需要预定义角色
+  - AGENT_PROMPTS 字典（第 22-67 行）：改为通用 Prompt
+  - SharedBoard 类（第 70-155 行）：移除共享状态板
+  - SubAgent 类（第 158-249 行）：移除子智能体概念
+  - create_sub_agents() 方法（第 547-560 行）
+  - _assign_tools() 方法（第 562-571 行）
+
+待新增内容：
+  + class ExecutionState: 管理单次执行的状态
+    - goal: str
+    - history: List[ThoughtActionObservation]
+    - current_step: int
+    - is_completed: bool
+    
+  + class UniversalAgent:
+    - async def think(self, observation: str) -> Thought:
+        # 调用 LLM 决定下一步
+        prompt = build_thought_prompt(observation, self.available_tools)
+        return await llm.generate_json(prompt)
+    
+    - async def act(self, thought: Thought) -> Observation:
+        # 执行动作（调用工具或结束）
+        if thought.action == "call_tool":
+            return await self.call_tool(thought.tool, thought.args)
+        elif thought.action == "finish":
+            return await self.synthesize_answer()
+    
+    - async def reflect(self, observation: Observation) -> Reflection:
+        # 评估执行质量，决定是否继续
+        quality_score = await self.evaluate_quality(observation)
+        return Reflection(should_continue=quality_score > threshold)
+    
+    - async def execute(self, goal: str) -> AsyncGenerator[Event, None]:
+        # ReAct 循环
+        state = ExecutionState(goal=goal)
+        while not state.is_completed and state.current_step < max_steps:
+            observation = build_observation(state)
+            thought = await self.think(observation)
+            yield Event(type="supervisor_thought", data=thought)
+            
+            if thought.action == "call_tool":
+                yield Event(type="tool_call_start", data=thought.tool)
+                result = await self.call_tool(thought.tool, thought.args)
+                yield Event(type="tool_call_end", data=result)
+                
+                reflection = await self.reflect(result)
+                yield Event(type="reflection", data=reflection)
+                
+                state.history.append((thought, result))
+                state.current_step += 1
+                
+            elif thought.action == "finish":
+                async for chunk in self.synthesize_answer(state):
+                    yield Event(type="final_answer_chunk", data=chunk)
+                state.is_completed = True
+
+修改工作量：5-7 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 2】统一工具调用层通过 MCP
+
+原代码位置：
+  - /workspace/server/tools/web_search.py
+  - /workspace/server/mcp/client.py
+  - /workspace/server/tools/base.py
+
+待修改内容：
+  1. 增强 MCPClient.connect()（第 41-118 行）
+     - 移除模拟模式，强制要求配置真实 MCP Server
+     - 添加自动重试机制（最多 3 次）
+     - 添加连接超时控制（30 秒）
+  
+  2. 增强 MCPClient.call_tool()（第 120-154 行）
+     - 添加参数校验（Schema 验证）
+     - 添加执行超时控制（60 秒）
+     - 添加错误分类（网络错误/API 错误/参数错误）
+  
+  3. 创建 MCPToolManager 类（新建文件）
+     ```python
+     class MCPToolManager:
+         def __init__(self):
+             self.servers: Dict[str, MCPClient] = {}
+             self.tools: Dict[str, ToolMetadata] = {}
+         
+         async def register_server(self, name: str, config: dict):
+             client = MCPClient(config)
+             await client.connect()
+             self.servers[name] = client
+             # 自动注册该 Server 的所有工具
+             for tool in client.get_tools():
+                 self.tools[tool.name] = ToolMetadata(tool, server_name=name)
+         
+         async def call_tool(self, tool_name: str, args: dict):
+             if tool_name not in self.tools:
+                 raise ValueError(f"未知工具：{tool_name}")
+             metadata = self.tools[tool_name]
+             client = self.servers[metadata.server_name]
+             return await client.call_tool(tool_name, args)
+     ```
+
+  4. 将 web_search.py 封装为 MCP Server
+     - 创建 /workspace/server/mcp/servers/web_search_server.py
+     - 实现标准 MCP 接口（list_tools, call_tool）
+     - 主服务启动时自动注册
+
+修改工作量：3-4 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 3】重构 Orchestrator 为 ReAct 引擎
+
+原代码位置：/workspace/server/core/orchestrator.py
+
+待删除内容：
+  - execute_flow() 方法的 for 循环结构（第 93-254 行）
+  - 预设 sub_agents 的执行逻辑
+  
+待新增内容：
+  + class ReactEngine:
+      def __init__(self, llm_provider, tool_manager):
+          self.llm = llm_provider
+          self.tools = tool_manager
+          self.max_steps = 20
+          self.step_timeout = 60  # 秒
+      
+      async def execute(self, goal: str) -> AsyncGenerator[dict, None]:
+          """ReAct 循环执行器"""
+          history = []
+          step = 0
+          
+          # Step 0: 初始规划
+          plan = await self.generate_plan(goal)
+          yield {"type": "task_plan", "data": plan}
+          
+          while step < self.max_steps:
+              # Think
+              thought = await self.think(goal, history)
+              yield {"type": "supervisor_thought", "data": thought}
+              
+              # Act
+              if thought["action"] == "call_tool":
+                  tool_result = await self.execute_tool(
+                      thought["tool"], 
+                      thought["args"],
+                      timeout=self.step_timeout
+                  )
+                  yield {"type": "tool_call_end", "data": tool_result}
+                  history.append({"thought": thought, "result": tool_result})
+                  
+                  # Reflect
+                  reflection = await self.reflect(goal, history)
+                  yield {"type": "reflection", "data": reflection}
+                  
+                  if reflection["should_finish"]:
+                      break
+                      
+              elif thought["action"] == "finish":
+                  # Synthesize
+                  async for chunk in self.synthesize(goal, history):
+                      yield {"type": "final_answer_chunk", "data": chunk}
+                  break
+              
+              step += 1
+          
+          yield {"type": "done", "data": {"steps": step, "history": history}}
+
+修改工作量：4-6 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 4】扩展 SSE 事件类型
+
+原代码位置：/workspace/server/routes/chat.py
+
+待新增事件类型：
+  + reflection: {
+      "step": int,
+      "observation_summary": str,
+      "quality_score": float,
+      "adjustment": str,  // 策略调整说明
+      "should_continue": bool
+    }
+  
+  + tool_call_progress: {
+      "tool": str,
+      "progress_percent": float,
+      "current_stage": str,  // "connecting"/"fetching"/"parsing"
+      "estimated_remaining": int  // 剩余秒数
+    }
+  
+  + error: {
+      "error_type": "tool_error/planning_error/llm_error",
+      "message": str,
+      "recoverable": bool,
+      "suggestion": str
+    }
+  
+  + execution_stats: {
+      "total_steps": int,
+      "successful_tool_calls": int,
+      "failed_tool_calls": int,
+      "total_tokens": int,
+      "total_duration": float
+    }
+
+修改 chat.py 中的 event_generator()：
+  - 在第 102 行后添加：yield execution_stats 事件（定期推送）
+  - 在工具调用时添加：yield tool_call_progress 事件（每 5 秒）
+  - 在每次工具调用后添加：yield reflection 事件
+
+修改工作量：2-3 天
+优先级：P1
+
+--------------------------------------------------------------------------------
+
+【修改 5】添加工具注册和管理机制
+
+原代码位置：/workspace/server/routes/tools.py
+
+待新增功能：
+  + GET /api/tools/discover
+    描述：发现并注册新工具（从 MCP Server）
+    返回：{"new_tools": [...], "updated_tools": [...]}
+  
+  + POST /api/tools/register
+    描述：手动注册工具（指定 MCP Server 配置）
+    请求：{"server_name": "...", "connection_type": "stdio/sse", ...}
+    返回：{"success": true, "tools_registered": 5}
+  
+  + DELETE /api/tools/{tool_id}
+    描述：注销工具
+    返回：{"success": true}
+  
+  + GET /api/tools/stats
+    描述：获取工具调用统计
+    返回：{
+      "tool_name": {
+        "total_calls": int,
+        "success_rate": float,
+        "avg_duration": float
+      }
+    }
+
+修改工作量：2-3 天
+优先级：P1
+
+================================================================================
+
+3.2 前端架构改造
+--------------------------------------------------------------------------------
+
+【修改 1】创建执行状态管理 Store
+
+新建文件：/workspace/frontend/src/store/executionStore.js
+
+```javascript
+import { create } from 'zustand';
+
+const executionStore = create((set, get) => ({
+  // 当前执行状态
+  currentExecution: null,  // { id, goal, status, startTime }
+  
+  // 执行历史（用于恢复）
+  executionHistory: [],
+  
+  // 结构化数据
+  supervisorThoughts: [],
+  taskPlan: null,
+  toolCalls: [],
+  reflections: [],
+  finalAnswer: '',
+  
+  // 状态更新方法
+  startExecution: (goal) => set({
+    currentExecution: {
+      id: Date.now(),
+      goal,
+      status: 'running',
+      startTime: new Date().toISOString()
+    },
+    supervisorThoughts: [],
+    taskPlan: null,
+    toolCalls: [],
+    reflections: [],
+    finalAnswer: ''
+  }),
+  
+  addThought: (thought) => set((state) => ({
+    supervisorThoughts: [...state.supervisorThoughts, thought]
+  })),
+  
+  updateTaskPlan: (plan) => set({ taskPlan: plan }),
+  
+  addToolCall: (toolCall) => set((state) => ({
+    toolCalls: [...state.toolCalls, toolCall]
+  })),
+  
+  updateToolCallProgress: (toolName, progress) => set((state) => ({
+    toolCalls: state.toolCalls.map(tc =>
+      tc.tool === toolName ? { ...tc, ...progress } : tc
+    )
+  })),
+  
+  addReflection: (reflection) => set((state) => ({
+    reflections: [...state.reflections, reflection]
+  })),
+  
+  appendAnswer: (chunk) => set((state) => ({
+    finalAnswer: state.finalAnswer + chunk
+  })),
+  
+  completeExecution: (stats) => set((state) => ({
+    currentExecution: { ...state.currentExecution, status: 'completed', stats },
+    executionHistory: [...state.executionHistory, state.currentExecution]
+  }))
+}));
+
+export default executionStore;
+```
+
+修改工作量：2-3 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 2】创建 SSE 事件处理 Hook
+
+新建文件：/workspace/frontend/src/hooks/useAgentExecution.js
+
+```javascript
+import { useEffect, useCallback } from 'react';
+import executionStore from '../store/executionStore';
+import { chatAPI } from '../services/api';
+
+export function useAgentExecution(sessionId) {
+  const store = executionStore();
+  
+  const handleSSEEvent = useCallback((event) => {
+    console.log('[useAgentExecution] 收到事件:', event.type, event.data);
+    
+    switch (event.type) {
+      case 'session_info':
+        // 初始化会话
+        break;
+        
+      case 'supervisor_thought':
+        store.addThought(event.data);
+        break;
+        
+      case 'task_plan':
+        store.updateTaskPlan(event.data);
+        break;
+        
+      case 'tool_call_start':
+        store.addToolCall({
+          tool: event.data.tool,
+          status: 'running',
+          startTime: Date.now(),
+          params: event.data.params
+        });
+        break;
+        
+      case 'tool_call_progress':
+        store.updateToolCallProgress(
+          event.data.tool,
+          event.data
+        );
+        break;
+        
+      case 'tool_call_end':
+        // 更新工具调用状态
+        store.addToolCall({
+          tool: event.data.tool,
+          status: event.data.status,
+          result: event.data.result,
+          endTime: Date.now()
+        });
+        break;
+        
+      case 'reflection':
+        store.addReflection(event.data);
+        break;
+        
+      case 'final_answer_chunk':
+        store.appendAnswer(event.data.chunk);
+        break;
+        
+      case 'error':
+        console.error('[Execution Error]', event.data);
+        break;
+        
+      case 'done':
+        store.completeExecution(event.data);
+        break;
+        
+      default:
+        console.warn('未知事件类型:', event.type);
+    }
+  }, [store]);
+  
+  const execute = useCallback(async (query) => {
+    store.startExecution(query);
+    
+    try {
+      await chatAPI.sendChatStream(
+        query,
+        sessionId,
+        null,
+        handleSSEEvent
+      );
+    } catch (error) {
+      console.error('[Execution Failed]', error);
+      store.completeExecution({ error: error.message });
+    }
+  }, [sessionId, handleSSEEvent, store]);
+  
+  return {
+    execute,
+    thoughts: store.supervisorThoughts,
+    taskPlan: store.taskPlan,
+    toolCalls: store.toolCalls,
+    reflections: store.reflections,
+    finalAnswer: store.finalAnswer,
+    status: store.currentExecution?.status || 'idle'
+  };
+}
+```
+
+修改工作量：2-3 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 3】重构 MessageBubble 组件
+
+原代码位置：/workspace/frontend/src/components/MessageBubble.jsx
+
+待修改内容：
+  1. 移除冗余的 thinking_process 显示（第 96-126 行）
+     - 已有 supervisor_thoughts，无需重复
+  
+  2. 移除 sub_agent_results 显示（第 149-169 行）
+     - 改为通过 tool_calls 和 reflections 展示
+  
+  3. 优化数据结构：
+     - 从 props.message 改为从 executionStore 订阅
+  
+  4. 添加新的展示模块：
+     + <ReflectionTimeline />: 展示反思历史
+     + <ExecutionStats />: 展示执行统计
+
+修改后的结构：
+```jsx
+<MessageBubble>
+  {/* 主智能体思考流 */}
+  <SupervisorThoughtCard thoughts={thoughts} />
+  
+  {/* 任务规划（动态展开） */}
+  <TaskPlanCard plan={taskPlan} completedSteps={toolCalls.length} />
+  
+  {/* 工具调用时间线 */}
+  <ToolCallTimeline calls={toolCalls} />
+  
+  {/* 反思历史 */}
+  <ReflectionTimeline reflections={reflections} />
+  
+  {/* 最终答案（流式） */}
+  <FinalAnswer content={finalAnswer} isStreaming={status === 'running'} />
+  
+  {/* 执行统计（完成后显示） */}
+  {status === 'completed' && <ExecutionStats stats={currentExecution.stats} />}
+</MessageBubble>
+```
+
+修改工作量：3-4 天
+优先级：P0
+
+--------------------------------------------------------------------------------
+
+【修改 4】优化 SSE 解析逻辑
+
+原代码位置：/workspace/frontend/src/services/api.js（第 48-104 行）
+
+待改进内容：
+  1. 添加事件乱序处理
+     - 使用缓冲区按 step 排序
+  
+  2. 添加心跳检测
+     - 超过 30 秒无事件则发送 ping
+  
+  3. 添加断线重连
+     - 指数退避重连策略
+  
+  4. 添加事件去重
+     - 基于 eventId 防止重复处理
+
+修改后的 parseSSE 函数：
+```javascript
+class SSEParser {
+  constructor(onEvent, onError) {
+    this.buffer = '';
+    this.eventQueue = [];
+    this.lastEventTime = Date.now();
+    this.onEvent = onEvent;
+    this.onError = onError;
+    this.heartbeatInterval = null;
+  }
+  
+  startHeartbeat() {
+    this.heartbeatInterval = setInterval(() => {
+      if (Date.now() - this.lastEventTime > 30000) {
+        console.warn('[SSE] 30 秒无事件，可能已断线');
+        // 触发重连逻辑
+      }
+    }, 10000);
+  }
+  
+  parse(chunk) {
+    this.lastEventTime = Date.now();
+    this.buffer += chunk;
+    
+    const lines = this.buffer.split('\n');
+    this.buffer = lines.pop();
+    
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        this.currentEvent = { type: line.slice(7) };
+      } else if (line.startsWith('data: ')) {
+        const data = JSON.parse(line.slice(6));
+        this.eventQueue.push({ ...this.currentEvent, data });
+        this.flushQueue();
+      }
+    }
+  }
+  
+  flushQueue() {
+    // 按 step 排序
+    this.eventQueue.sort((a, b) => 
+      (a.data.step || 0) - (b.data.step || 0)
+    );
+    
+    // 去重
+    const seen = new Set();
+    this.eventQueue = this.eventQueue.filter(e => {
+      const key = `${e.type}-${e.data.step}-${e.data.tool || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    
+    // 依次处理
+    while (this.eventQueue.length > 0) {
+      const event = this.eventQueue.shift();
+      this.onEvent(event);
+    }
+  }
+}
+```
+
+修改工作量：2-3 天
+优先级：P1
+
+================================================================================
+
+四、工具接入计划（基于现有工具扩展）
+================================================================================
+
+4.1 基础工具（必须接入，通过 MCP 封装）
+--------------------------------------------------------------------------------
+工具名          | 当前实现位置               | MCP 封装优先级 | 预计工作量
+---------------|---------------------------|---------------|----------
+web_search     | tools/web_search.py       | P0            | 1 天
+web_reader     | tools/web_search.py       | P0            | 1 天
+calculator     | 需新建                     | P0            | 0.5 天
+text_summarizer| 需新建（调用 LLM）         | P1            | 1 天
+file_reader    | 需新建                     | P1            | 0.5 天
+file_writer    | 需新建                     | P1            | 0.5 天
+
+--------------------------------------------------------------------------------
+
+4.2 MCP Server 部署方案
+--------------------------------------------------------------------------------
+
+方案 A：本地 stdio Server（推荐开发环境）
+```bash
+# 启动命令示例
+npx -y @modelcontextprotocol/server-filesystem /workspace/data
+python -m server.mcp.servers.web_search_server
+```
+
+方案 B：远程 SSE Server（推荐生产环境）
+```python
+# 使用 FastMCP 框架
+from fastmcp import FastMCP
+
+mcp = FastMCP("WebSearch")
+
+@mcp.tool()
+def search_web(query: str) -> list:
+    return await real_search(query)
+
+if __name__ == "__main__":
+    mcp.run(transport="sse", host="0.0.0.0", port=8080)
+```
+
+配置示例（存入数据库）：
+```json
+{
+  "servers": [
+    {
+      "name": "web_search",
+      "connection_type": "stdio",
+      "command": "python",
+      "args": ["-m", "server.mcp.servers.web_search_server"],
+      "env_vars": {"SEARCH_API_KEY": "..."},
+      "enabled": true
+    },
+    {
+      "name": "finance_data",
+      "connection_type": "sse",
+      "url": "http://localhost:8081/sse",
+      "enabled": true
+    }
+  ]
+}
+```
+
+================================================================================
+
+五、实现路线图（精准估算）
+================================================================================
+
+阶段 1：核心架构改造（2-3 周）🔧
+--------------------------------------------------------------------------------
+Week 1:
+  □ 创建 UniversalAgent 类（替代 SupervisorAgent）
+  □ 实现 ReAct 循环基础框架（think/act/reflect）
+  □ 创建 ExecutionState 状态管理类
+  □ 编写单元测试覆盖核心逻辑
+
+Week 2:
+  □ 增强 MCPClient 支持真实工具调用
+  □ 创建 MCPToolManager 统一管理工具
+  □ 将 web_search 封装为 MCP Server
+  □ 集成到 chat 路由，替换原有 Orchestrator
+
+Week 3:
+  □ 扩展 SSE 事件类型（reflection/progress/error）
+  □ 前端创建 executionStore 状态管理
+  □ 实现 useAgentExecution Hook
+  □ 重构 MessageBubble 组件
+
+验收标准：
+  ✓ 能执行单步工具调用任务（如"搜索 Python 教程"）
+  ✓ 主智能体思考流式显示
+  ✓ 工具调用卡片实时更新状态
+  ✓ 最终答案流式输出
+
+--------------------------------------------------------------------------------
+
+阶段 2：规划能力增强（2-3 周）🚀
+--------------------------------------------------------------------------------
+Week 4:
+  □ 优化 think() 提示词，添加 few-shot 示例
+  □ 实现工具选择置信度评估
+  □ 添加执行步骤可视化（前端 Stepper 组件）
+
+Week 5:
+  □ 实现 reflect() 深度反思机制
+  □ 支持策略调整（跳过/重试/插入新步骤）
+  □ 添加执行日志持久化（SQLite/PostgreSQL）
+
+Week 6:
+  □ 实现断点续传（刷新后恢复执行）
+  □ 添加执行统计面板
+  □ 性能优化（减少 LLM 调用次数）
+
+验收标准：
+  ✓ 能执行多步任务（如"搜索并总结 3 篇文章"）
+  ✓ 执行受阻时自动调整策略
+  ✓ 刷新页面后能恢复执行状态
+  ✓ 任务规划合理性>85%
+
+--------------------------------------------------------------------------------
+
+阶段 3：工具生态扩展（持续）🌟
+--------------------------------------------------------------------------------
+Month 2:
+  □ 接入 finance_data MCP Server（Yahoo Finance API）
+  □ 接入 code_runner MCP Server（本地沙箱）
+  □ 实现工具调用权限控制
+  □ 添加工具调用审计日志
+
+Month 3:
+  □ 支持并行工具调用（加速执行）
+  □ 实现工具缓存机制（减少重复调用）
+  □ 添加工具市场 UI（用户可浏览/启用/禁用）
+
+验收标准：
+  ✓ 支持至少 5 个不同场景任务
+  ✓ 新工具接入无需修改智能体代码
+  ✓ 工具调用成功率>95%
+
+--------------------------------------------------------------------------------
+
+阶段 4：高级能力（1-2 月）🏆
+--------------------------------------------------------------------------------
+□ 支持多轮对话上下文记忆
+□ 支持用户中途打断和追问
+□ 支持执行过程可视化编辑
+□ 性能优化（响应时间<10 秒）
+
+================================================================================
+
+六、验证标准（量化指标）
+================================================================================
+
+6.1 功能验证
+--------------------------------------------------------------------------------
+✅ 场景覆盖测试：
+   - [ ] "搜索 Python 教程" → 调用 web_search
+   - [ ] "读取 https://example.com 内容" → 调用 web_reader
+   - [ ] "计算 123*456" → 调用 calculator
+   - [ ] "分析特斯拉财报" → 连续调用 web_search + calculator
+   - [ ] "写一个快速排序" → 调用 code_runner（如有）
+
+✅ 工具热插拔测试：
+   - [ ] 运行时注册新 MCP Server
+   - [ ] 下次任务自动发现并使用新工具
+   - [ ] 禁用工具后不再调用
+
+✅ 动态规划测试：
+   - [ ] 同一目标，多次执行路径不同（合理变化）
+   - [ ] 工具调用失败时自动切换备选方案
+   - [ ] 用户中途修改目标后能调整执行计划
+
+--------------------------------------------------------------------------------
+
+6.2 性能验证
+--------------------------------------------------------------------------------
+✅ 响应时间（P95）：
+   - [ ] 首字延迟（Time to First Token）: <2 秒
+   - [ ] 简单任务（1-2 步）: <15 秒
+   - [ ] 中等任务（3-5 步）: <40 秒
+   - [ ] 复杂任务（5+ 步）: <80 秒
+
+✅ 成功率：
+   - [ ] 工具调用成功率：>95%
+   - [ ] 任务完成率：>90%
+   - [ ] 规划合理性（人工评估）：>85%
+
+✅ 资源消耗：
+   - [ ] 平均 LLM Token 消耗：<5000 tokens/任务
+   - [ ] 内存占用：<500MB（并发 10 用户）
+
+--------------------------------------------------------------------------------
+
+6.3 体验验证
+--------------------------------------------------------------------------------
+✅ 流式体验：
+   - [ ] 首屏思考内容显示延迟 <500ms
+   - [ ] SSE 事件处理延迟 <200ms
+   - [ ] 最终答案输出速度：50-100 字/秒
+
+✅ 可视化：
+   - [ ] 卡片展开/折叠动画流畅（60fps）
+   - [ ] 进度条更新平滑（无跳变）
+   - [ ] 错误提示清晰易懂
+
+✅ 可控性：
+   - [ ] 用户可随时点击"停止"按钮中断执行
+   - [ ] 支持重试失败的工具调用
+   - [ ] 刷新后状态完整恢复
+
+================================================================================
+
+七、关键修改清单（开发对照表）
+================================================================================
+
+后端修改 (Backend Modifications)
+--------------------------------------------------------------------------------
+【核心架构层】
+□ 1. 新建 /workspace/server/agents/universal.py
+   - 实现 UniversalAgent 类（ReAct 循环）
+   - 实现 ExecutionState 类
+   - 实现 Thought/Action/Observation 数据结构
+
+□ 2. 废弃 /workspace/server/agents/supervisor.py 中的 SubAgent
+   - 保留 analyze_intent() 和 decompose_task() 作为辅助函数
+   - 移除 execute() 方法的多智能体并行逻辑
+
+□ 3. 重构 /workspace/server/core/orchestrator.py
+   - 将 AgentOrchestrator 改为 ReactEngine
+   - 实现 think()/act()/reflect() 三步循环
+   - 添加最大步数限制和超时熔断
+
+□ 4. 增强 /workspace/server/mcp/client.py
+   - 移除模拟模式（第 43-65 行）
+   - 添加自动重试和超时控制
+   - 实现工具 Schema 验证
+
+【工具管理层】
+□ 5. 新建 /workspace/server/mcp/tool_manager.py
+   - 实现 MCPToolManager 类
+   - 实现工具动态注册和发现
+   - 实现工具调用统计
+
+□ 6. 新建 /workspace/server/mcp/servers/web_search_server.py
+   - 将 web_search.py 功能封装为 MCP Server
+   - 实现标准 list_tools/call_tool 接口
+
+□ 7. 修改 /workspace/server/routes/tools.py
+   - 添加 /discover /register /stats 端点
+   - 实现工具 CRUD 操作
+
+【路由层】
+□ 8. 修改 /workspace/server/routes/chat.py
+   - 替换 SupervisorAgent 为 UniversalAgent
+   - 添加新 SSE 事件类型（reflection/progress/error）
+   - 实现执行统计定期推送
+
+【数据层】
+□ 9. 修改 /workspace/server/utils/database.py
+   - 扩展 Message 表支持存储 execution_history
+   - 添加 execution_logs 表记录详细执行过程
+
+--------------------------------------------------------------------------------
+
+前端修改 (Frontend Modifications)
+--------------------------------------------------------------------------------
+【状态管理层】
+□ 1. 新建 /workspace/frontend/src/store/executionStore.js
+   - 使用 Zustand 创建全局状态
+   - 实现 startExecution/addThought/updateTaskPlan 等方法
+
+□ 2. 新建 /workspace/frontend/src/hooks/useAgentExecution.js
+   - 封装 SSE 事件处理逻辑
+   - 提供 execute/thoughts/toolCalls 等接口
+
+【组件层】
+□ 3. 重构 /workspace/frontend/src/components/MessageBubble.jsx
+   - 移除 thinking_process 和 sub_agent_results 显示
+   - 添加 ReflectionTimeline 组件
+   - 添加 ExecutionStats 组件
+
+□ 4. 新建 /workspace/frontend/src/components/ToolCallTimeline.jsx
+   - 以时间线形式展示工具调用历史
+   - 支持展开查看详情
+
+□ 5. 新建 /workspace/frontend/src/components/ReflectionTimeline.jsx
+   - 展示反思历史和策略调整
+
+□ 6. 新建 /workspace/frontend/src/components/ExecutionStats.jsx
+   - 展示执行统计（步数/成功率/耗时）
+
+【服务层】
+□ 7. 优化 /workspace/frontend/src/services/api.js
+   - 添加 SSEParser 类处理乱序/去重
+   - 添加心跳检测和断线重连
+   - 添加错误分类处理
+
+【样式层】
+□ 8. 优化 /workspace/frontend/src/index.css
+   - 添加新组件的 Tailwind 样式
+   - 优化动画过渡效果
+
+================================================================================
+
+八、风险与应对
+================================================================================
+
+风险 1：LLM 规划质量不稳定
+--------------------------------------------------------------------------------
+表现：任务拆解不合理，工具选择错误，陷入死循环
+应对：
+  ✓ 优化提示词，添加领域特定的 few-shot 示例
+  ✓ 实现工具选择置信度评估（低于阈值则询问用户）
+  ✓ 添加死循环检测（相同步骤重复 3 次则终止）
+  ✓ 实现人工审核模式（关键任务需用户确认后再执行）
+
+--------------------------------------------------------------------------------
+
+风险 2：MCP 工具调用失败率高
+--------------------------------------------------------------------------------
+表现：API 限流、超时、返回错误、连接断开
+应对：
+  ✓ 实现指数退避重试机制（1s/2s/4s/8s）
+  ✓ 实现分级超时控制（连接 10s/执行 60s）
+  ✓ 实现降级策略（搜索失败则用缓存/备用 API）
+  ✓ 添加健康检查（定期 ping MCP Server）
+
+--------------------------------------------------------------------------------
+
+风险 3：执行时间过长用户流失
+--------------------------------------------------------------------------------
+表现：复杂任务耗时>1 分钟，用户失去耐心
+应对：
+  ✓ 设置最大执行步数（默认 15 步，可配置）
+  ✓ 支持并行工具调用（独立工具同时执行）
+  ✓ 实现用户可打断机制（随时点击停止）
+  ✓ 优化进度展示（让用户感知系统在工作）
+
+--------------------------------------------------------------------------------
+
+风险 4：前端性能瓶颈
+--------------------------------------------------------------------------------
+表现：长对话场景下滚动卡顿，内存泄漏
+应对：
+  ✓ 实现虚拟滚动（只渲染可见区域）
+  ✓ 实现组件懒加载（按需加载重型组件）
+  ✓ 优化状态更新频率（防抖/节流）
+  ✓ 定期清理过期执行历史（保留最近 50 条）
+
+--------------------------------------------------------------------------------
+
+风险 5：MCP SDK 兼容性问题
+--------------------------------------------------------------------------------
+表现：不同版本 MCP SDK API 不一致，连接失败
+应对：
+  ✓ 锁定 MCP SDK 版本（requirements.txt 指定版本号）
+  ✓ 实现适配器模式屏蔽版本差异
+  ✓ 提供纯 HTTP 降级方案（不依赖 SDK）
+  ✓ 添加详细的错误日志便于排查
+
+================================================================================
+
+九、迁移策略（平滑过渡）
+================================================================================
+
+阶段 0：兼容性准备（1 周）
+--------------------------------------------------------------------------------
+□ 保留原有 SupervisorAgent 作为 fallback
+□ 添加功能开关（feature flag）控制新旧模式切换
+□ 实现 A/B 测试框架（5% 流量走新模式）
+
+阶段 1：灰度发布（2 周）
+--------------------------------------------------------------------------------
+□ 内部测试：开发团队 100% 使用新模式
+□ 小范围公测：邀请 50 名种子用户体验
+□ 收集反馈，修复关键 bug
+
+阶段 2：全量发布（1 周）
+--------------------------------------------------------------------------------
+□ 新模式默认开启
+□ 保留旧模式入口（用户可手动切换）
+□ 监控关键指标（成功率/耗时/用户满意度）
+
+阶段 3：旧模式下线（1 月后）
+--------------------------------------------------------------------------------
+□ 数据分析：新旧模式对比报告
+□ 如果新模式指标优秀，下线旧模式
+□ 清理废弃代码（SupervisorAgent/SubAgent 等）
+
+================================================================================
+
+十、总结
+================================================================================
+
+核心改造目标：
+  从"场景驱动的专用系统"改造为"能力驱动的通用系统"
+
+核心改造内容：
+  1. 智能体：多智能体并行 → 单通用智能体 ReAct 循环
+  2. 规划：硬编码规则 → LLM 动态规划 + 反思调整
+  3. 工具：模拟调用 → 真实 MCP 工具 + 热插拔
+  4. 执行：固定流程 → 动态适应 + 错误恢复
+  5. 前端：一次性输出 → 流式渐进展示 + 状态可恢复
+
+预期效果：
+  ✓ 一个智能体，适应无限场景
+  ✓ 新能力 = 新工具（无需改代码）
+  ✓ 新场景 = 新规划（LLM 自动适配）
+  ✓ 用户体验：全程透明，等待感知缩短 50%+
+  ✓ 系统可维护性：代码量减少 30%，扩展性提升 10 倍
+
+一句话总结：
+  真正的通用智能体，不是"什么都会的超人"，而是"会用工具的普通人"。
+  它不需要预设所有场景的解决方案，只需要理解目标、选择工具、达成结果。
+  这次改造不是简单的代码重构，而是架构范式的根本转变。
+
+================================================================================
+附录：相关文件清单
+================================================================================
+
+后端文件（/workspace/server/）：
+  - agents/supervisor.py        → 重构为 universal.py
+  - agents/__init__.py          → 导出 UniversalAgent
+  - core/orchestrator.py        → 重构为 react_engine.py
+  - mcp/client.py               → 增强错误处理和重试
+  - mcp/tool_manager.py         → 新建
+  - mcp/servers/*.py            → 新建 MCP Server 实现
+  - routes/chat.py              → 更新 SSE 事件类型
+  - routes/tools.py             → 添加工具管理端点
+  - utils/database.py           → 扩展数据模型
+
+前端文件（/workspace/frontend/src/）：
+  - store/index.js              → 集成 executionStore
+  - store/executionStore.js     → 新建
+  - hooks/useAgentExecution.js  → 新建
+  - components/MessageBubble.jsx → 重构
+  - components/ToolCallTimeline.jsx → 新建
+  - components/ReflectionTimeline.jsx → 新建
+  - components/ExecutionStats.jsx → 新建
+  - services/api.js             → 优化 SSE 解析
+
+配置文件：
+  - requirements.txt            → 添加 mcp SDK
+  - package.json                → 添加 zustand 依赖
+  - .env.example                → 添加 MCP 配置示例
+
+================================================================================
