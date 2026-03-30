@@ -11,7 +11,8 @@ from datetime import datetime
 from ..utils.db_init import get_db
 from ..utils.database import Session as DBSession, Message
 from ..agents.supervisor import SupervisorAgent
-from ..utils.llm_client import create_llm_client
+from ..core.orchestrator import AgentOrchestrator
+from ..llm.providers.base import create_llm_provider
 from ..utils.config import get_settings
 import asyncio
 
@@ -85,15 +86,16 @@ async def send_message(
     
     # 4. 定义 SSE 生成器
     async def event_generator():
-        # 创建 LLM 客户端
+        # 创建 LLM Provider
         settings = get_settings()
-        llm_client = await create_llm_client(
-            provider=settings.LLM_PROVIDER,
+        llm_provider = create_llm_provider(
+            provider_type=settings.LLM_PROVIDER,
             api_key=settings.LLM_API_KEY,
             base_url=settings.LLM_BASE_URL,
             model=settings.LLM_MODEL
         )
         
+        # 使用 SupervisorAgent 进行意图分析和任务拆解
         supervisor = SupervisorAgent()
         
         try:
@@ -107,21 +109,20 @@ async def send_message(
             print(f"[SSE] ⚠️ 关键：ai_message.id = {ai_message.id}")
             yield f"event: session_info\ndata: {session_info_data}\n\n"
             
-            # 关键新增：主智能体开始思考
-            thought_event = json.dumps({
-                'type': 'supervisor_thought',
-                'action': 'analyzing_query',
-                'message': '正在理解用户查询...'
-            })
-            yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
-            await asyncio.sleep(0.3)
+            # 意图分析
+            intent = await supervisor.analyze_intent(query, llm_client=llm_provider)
             
-            # 执行智能体任务（传入 LLM 客户端）
-            task_result = await supervisor.execute(query, llm_client=llm_client)
-            print(f"[SSE] 任务执行完成，类型：{task_result.get('is_simple')}")
-            
-            # 如果是简单任务
-            if task_result.get("is_simple"):
+            # 简单任务处理
+            if not intent.get("requires_multi_agent", False):
+                # 主智能体开始思考
+                thought_event = json.dumps({
+                    'type': 'supervisor_thought',
+                    'action': 'analyzing_query',
+                    'message': '正在理解用户查询...'
+                })
+                yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
+                await asyncio.sleep(0.3)
+                
                 # 主智能体决策
                 decision_event = json.dumps({
                     'type': 'supervisor_decision',
@@ -134,18 +135,25 @@ async def send_message(
                 yield f"event: agent_update\ndata: {json.dumps({'type': 'agent_update', 'agent': 'supervisor', 'status': 'thinking', 'message': '正在思考...'})}\n\n"
                 await asyncio.sleep(0.5)
                 
-                # 流式输出答案
-                content = task_result["content"]
-                print(f"[SSE] 开始流式传输，内容长度：{len(content)}")
-                for i in range(0, len(content), 10):
-                    chunk = content[i:i+10]
-                    chunk_data = json.dumps({
-                        'type': 'final_answer_chunk',
-                        'chunk': chunk
-                    })
-                    print(f"[SSE] 发送 chunk: {chunk}")
-                    yield f"event: final_answer_chunk\ndata: {chunk_data}\n\n"
-                    await asyncio.sleep(0.05)
+                # 使用 LLM 流式生成答案
+                messages = [
+                    {"role": "system", "content": "你是一个智能助手。请用中文详细、专业地回答用户的问题。"},
+                    {"role": "user", "content": query}
+                ]
+                
+                stream_response = llm_provider.chat_completion_stream(messages)
+                content = ""
+                
+                async for chunk in stream_response:
+                    chunk_content = chunk.get("content", "")
+                    if chunk_content:
+                        content += chunk_content
+                        chunk_data = json.dumps({
+                            'type': 'final_answer_chunk',
+                            'chunk': chunk_content
+                        })
+                        yield f"event: final_answer_chunk\ndata: {chunk_data}\n\n"
+                        await asyncio.sleep(0.02)
                 
                 # 更新 AI 消息
                 ai_message.content = content
@@ -156,211 +164,84 @@ async def send_message(
                 }]
             
             else:
-                # 复杂任务：多智能体协作（关键修复：实现思考 - 工具调用 - 思考的交替循环）
-                print(f"[Chat] 开始多智能体编排，子智能体数量：{len(task_result['sub_agents'])}")
+                # 复杂任务：使用 Orchestrator 进行流式编排
+                print(f"[Chat] 开始多智能体编排，意图：{intent}")
+                
+                # 任务拆解
+                sub_tasks = await supervisor.decompose_task(query, intent, llm_client=llm_provider)
+                sub_agents = await supervisor.create_sub_agents(sub_tasks)
+                
+                # 转换为字典格式供 Orchestrator 使用
+                sub_agents_dict = [
+                    {
+                        "id": agent.id,
+                        "role": agent.role,
+                        "task": agent.task,
+                        "tools": agent.available_tools,
+                        "output": None,  # 将由 Orchestrator 填充
+                        "duration": 0
+                    }
+                    for agent in sub_agents
+                ]
+                
+                # 使用 Orchestrator 执行流式流程
+                orchestrator = AgentOrchestrator(llm_provider)
                 
                 thinking_process = []
                 sub_agent_results = []
                 tool_call_count = 0
-                completed_steps = 0
+                final_content = ""
                 
-                # 主智能体决策：任务拆解
-                decision_event = json.dumps({
-                    'type': 'supervisor_decision',
-                    'decision': 'complex_task',
-                    'message': f'这是一个复杂任务，需要{len(task_result["sub_agents"])}个子智能体协作',
-                    'reasoning': task_result.get('intent', {}).get('reasoning', '')
-                })
-                yield f"event: supervisor_decision\ndata: {decision_event}\n\n"
-                await asyncio.sleep(0.5)
-                
-                # 初始任务规划（只展示第一步，后续逐步揭示）
-                first_step = task_result['sub_agents'][0] if task_result['sub_agents'] else None
-                if first_step:
-                    task_plan_event = json.dumps({
-                        'type': 'task_plan',
-                        'total_steps': len(task_result['sub_agents']),
-                        'steps': [
-                            {
-                                'step': 1,
-                                'role': first_step['role'],
-                                'task': first_step['task'],
-                                'status': 'pending',
-                                'revealed': True  # 只揭示第一步
-                            }
-                        ]
-                    })
-                    yield f"event: task_plan\ndata: {task_plan_event}\n\n"
-                    await asyncio.sleep(0.5)
-                
-                # 关键修复：逐个执行子智能体并实现“思考 - 执行 - 反思”循环
-                for idx, sub_agent in enumerate(task_result["sub_agents"]):
-                    agent_id = sub_agent.get("id") or sub_agent.get("agent_id")
-                    role = sub_agent["role"]
+                async for event in orchestrator.execute_flow(query, sub_agents_dict):
+                    event_type = event['type']
+                    event_data = event['data']
                     
-                    # 主智能体思考：是否继续下一步
-                    if idx > 0:
-                        # 发送下一步决策事件
-                        next_step_event = json.dumps({
-                            'type': 'next_step_decision',
-                            'current_step': idx,
-                            'total_steps': len(task_result['sub_agents']),
-                            'message': f'第{idx}步已完成，评估是否需要继续执行下一步...'
+                    # 直接推送事件到前端
+                    yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
+                    
+                    # 累积结构化数据
+                    if event_type == 'agent_update' and event_data.get('status') == 'completed':
+                        thinking_process.append({
+                            "agent": event_data.get('agent'),
+                            "action": event_data.get('task'),
+                            "tool_calls": event_data.get('tool_calls', 0),
+                            "duration": event_data.get('duration', 1.0),
+                            "timestamp": datetime.utcnow().isoformat()
                         })
-                        yield f"event: next_step_decision\ndata: {next_step_event}\n\n"
-                        await asyncio.sleep(0.3)
                         
-                        # 揭示下一步到任务规划
-                        current_step = task_result['sub_agents'][idx]
-                        reveal_step_event = json.dumps({
-                            'type': 'task_plan_update',
-                            'new_step': {
-                                'step': idx + 1,
-                                'role': current_step['role'],
-                                'task': current_step['task'],
-                                'status': 'pending',
-                                'revealed': True
-                            }
+                        sub_agent_results.append({
+                            "agent_id": event_data.get('agent_id'),
+                            "role": event_data.get('agent'),
+                            "task": event_data.get('task'),
+                            "output": event_data.get('output'),
+                            "tool_calls": event_data.get('tool_calls', 0),
+                            "duration": event_data.get('duration', 1.0)
                         })
-                        yield f"event: task_plan_update\ndata: {reveal_step_event}\n\n"
-                        await asyncio.sleep(0.3)
+                        
+                        if event_data.get('tool_calls', 0) > 0:
+                            tool_call_count += event_data.get('tool_calls', 0)
                     
-                    # 主智能体思考：开始执行这一步
-                    thought_event = json.dumps({
-                        'type': 'supervisor_thought',
-                        'action': 'starting_step',
-                        'step': idx + 1,
-                        'total': len(task_result['sub_agents']),
-                        'message': f'开始执行第{idx + 1}步：{role} - {sub_agent["task"][:30]}...'
-                    })
-                    yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
-                    await asyncio.sleep(0.3)
+                    elif event_type == 'final_answer_chunk':
+                        final_content += event_data.get('chunk', '')
                     
-                    # 智能体启动事件
-                    event_data = json.dumps({
-                        'type': 'agent_update',
-                        'agent': role,
-                        'agent_id': agent_id,
-                        'status': 'running',
-                        'message': f'{role} 正在执行：{sub_agent["task"]}',
-                        'task': sub_agent['task'],
-                        'tools': sub_agent.get('tools', [])
-                    })
-                    yield f"event: agent_update\ndata: {event_data}\n\n"
-                    
-                    # 工具调用开始（如果有真实工具）
-                    if sub_agent.get('tools'):
-                        tool_start_event = json.dumps({
-                            'type': 'tool_call_start',
-                            'tool': sub_agent['tools'][0],
-                            'agent_id': agent_id,
-                            'params': {'query': sub_agent['task']},
-                            'step': idx + 1
-                        })
-                        yield f"event: tool_call_start\ndata: {tool_start_event}\n\n"
-                    
-                    # 等待子智能体执行完成
-                    await asyncio.sleep(0.5)
-                    
-                    # 工具调用结果
-                    if sub_agent.get('tools'):
-                        tool_end_event = json.dumps({
-                            'type': 'tool_call_end',
-                            'tool': sub_agent['tools'][0],
-                            'agent_id': agent_id,
-                            'status': 'success',
-                            'result': '找到相关信息',
-                            'duration': sub_agent.get("duration", 1.0),
-                            'step': idx + 1
-                        })
-                        yield f"event: tool_call_end\ndata: {tool_end_event}\n\n"
-                        tool_call_count += 1
-                    
-                    # 智能体完成
-                    event_data = json.dumps({
-                        'type': 'agent_update',
-                        'agent': role,
-                        'agent_id': agent_id,
-                        'status': 'completed',
-                        'output': sub_agent['output'],
-                        'task': sub_agent['task'],
-                        'tool_calls': sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
-                        'duration': sub_agent.get("duration", 1.0)
-                    })
-                    yield f"event: agent_update\ndata: {event_data}\n\n"
-                    
-                    # 主智能体反思：评估完成质量
-                    thought_event = json.dumps({
-                        'type': 'supervisor_thought',
-                        'action': 'step_completed',
-                        'step': idx + 1,
-                        'message': f'第{idx + 1}步完成，耗时{sub_agent.get("duration", 1.0):.1f}秒，检查结果质量...'
-                    })
-                    yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
-                    await asyncio.sleep(0.3)
-                    
-                    # 判断是否需要继续下一步
-                    if idx < len(task_result['sub_agents']) - 1:
-                        reflection_event = json.dumps({
-                            'type': 'supervisor_reflecting',
-                            'step': idx + 1,
-                            'message': f'第{idx + 1}步结果良好，准备启动第{idx + 2}步...'
-                        })
-                        yield f"event: supervisor_reflecting\ndata: {reflection_event}\n\n"
-                        await asyncio.sleep(0.3)
-                    
-                    thinking_process.append({
-                        "agent": role,
-                        "action": sub_agent["task"],
-                        "tool_calls": sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
-                        "duration": sub_agent.get("duration", 1.0),
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    
-                    # 累积子智能体结果
-                    sub_agent_results.append({
-                        "agent_id": agent_id,
-                        "role": role,
-                        "task": sub_agent["task"],
-                        "output": sub_agent["output"],
-                        "tool_calls": sub_agent.get('tool_calls', 1) if sub_agent.get('tools') else 0,
-                        "duration": sub_agent.get("duration", 1.0)
-                    })
-                    
-                    completed_steps += 1
+                    elif event_type == 'done':
+                        # 更新最终统计数据
+                        event_data['thinking_process'] = thinking_process
+                        event_data['sub_agent_results'] = sub_agent_results
                 
-                # 所有子智能体完成后，主智能体汇总
-                thought_event = json.dumps({
-                    'type': 'supervisor_thought',
-                    'action': 'aggregating',
-                    'message': f'所有{len(sub_agent_results)}个子智能体已完成，正在汇总结果...'
-                })
-                yield f"event: supervisor_thought\ndata: {thought_event}\n\n"
-                await asyncio.sleep(0.5)
+                # 更新 AI 消息
+                ai_message.content = final_content or ''.join([r['output'] for r in sub_agent_results if r.get('output')])
+                ai_message.thinking_process = thinking_process
+                ai_message.sub_agent_results = sub_agent_results
+                ai_message.msg_metadata = {
+                    "total_duration": sum(r["duration"] for r in sub_agent_results),
+                    "total_tool_calls": tool_call_count,
+                    "agents_used": list(set(r["role"] for r in sub_agent_results)),
+                    "sub_agent_count": len(sub_agent_results)
+                }
                 
-                # 所有子智能体完成后，主智能体汇总
-                event_data = json.dumps({
-                    'type': 'agent_update',
-                    'agent': 'supervisor',
-                    'status': 'aggregating',
-                    'message': '所有子智能体已完成，正在汇总结果...',
-                    'completed_count': len(sub_agent_results),
-                    'total_count': len(task_result['sub_agents'])
-                })
-                yield f"event: agent_update\ndata: {event_data}\n\n"
-                await asyncio.sleep(0.5)
-                
-                # 关键修复：如果有 LLM 客户端，使用 LLM 实时生成总结而不是简单拼接
-                settings = get_settings()
-                llm_client_for_summary = await create_llm_client(
-                    provider=settings.LLM_PROVIDER,
-                    api_key=settings.LLM_API_KEY,
-                    base_url=settings.LLM_BASE_URL,
-                    model=settings.LLM_MODEL
-                )
-                
-                if llm_client_for_summary and len(sub_agent_results) > 0:
-                    # 使用 LLM 进行实时综合推理生成最终答案
+                # 关键修复：使用 LLM 流式生成最终答案
+                if not final_content and len(sub_agent_results) > 0:
                     print(f"[Chat] 使用 LLM 实时生成最终答案...")
                     
                     # 构建上下文信息
@@ -390,137 +271,46 @@ async def send_message(
                         {"role": "user", "content": user_message}
                     ]
                     
-                    # 关键修复：使用流式调用 LLM
-                    stream_response = await llm_client_for_summary.chat_completion(
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=2048,
-                        stream=True  # 启用流式
-                    )
+                    # 使用 LLM Provider 的流式接口
+                    stream_response = llm_provider.chat_completion_stream(messages)
                     
-                    # 实时流式输出 LLM 生成的内容
-                    print(f"[Chat] 开始流式输出 LLM 生成的答案...")
+                    final_content = ""
                     async for chunk in stream_response:
                         chunk_content = chunk.get("content", "")
                         if chunk_content:
+                            final_content += chunk_content
                             chunk_data = json.dumps({
                                 'type': 'final_answer_chunk',
                                 'chunk': chunk_content
                             })
                             yield f"event: final_answer_chunk\ndata: {chunk_data}\n\n"
-                            await asyncio.sleep(0.02)  # 更小的延迟，更流畅
+                            await asyncio.sleep(0.02)
                     
-                    # 更新 AI 消息（内容已在流式中累积）
-                    ai_message.content = stream_response.get("full_content", "")
+                    # 更新 AI 消息内容
+                    ai_message.content = final_content or ''.join([r['output'] for r in sub_agent_results if r.get('output')])
+                    ai_message.thinking_process = thinking_process
+                    ai_message.sub_agent_results = sub_agent_results
+                    ai_message.msg_metadata = {
+                        "total_duration": sum(r["duration"] for r in sub_agent_results),
+                        "total_tool_calls": tool_call_count,
+                        "agents_used": list(set(r["role"] for r in sub_agent_results)),
+                        "sub_agent_count": len(sub_agent_results)
+                    }
                     
-                else:
-                    # 降级方案：没有 LLM 时使用原有逻辑
-                    print(f"[Chat] 降级：使用拼接方式生成最终答案")
-                    final_answer = task_result.get("final_answer", "")
-                    
-                    # 关键修复：如果 final_answer 为空或质量太低，现场生成详细总结
-                    if not final_answer or len(final_answer) < 100:
-                        print(f"[Chat] final_answer 质量不足 (长度:{len(final_answer)}), 现场生成详细总结")
-                        
-                        # 从子智能体的 output 中提取有用信息
-                        collected_info = []
-                        for sa in sub_agent_results:
-                            output = sa.get('output', '')
-                            if output and len(output) > 20:
-                                collected_info.append(f"- **{sa['role']}**: {output}")
-                        
-                        # 生成结构化总结
-                        final_answer = f"## 任务执行报告\n\n"
-                        final_answer += f"已启动 {len(sub_agent_results)} 个智能体进行协作分析：\n\n"
-                        
-                        if collected_info:
-                            final_answer += "### 各智能体执行情况：\n"
-                            final_answer += "\n".join(collected_info)
-                            final_answer += "\n\n"
-                        
-                        # 如果有共享状态板的数据
-                        shared_board = task_result.get('shared_board', {})
-                        key_findings = shared_board.get('key_findings', [])
-                        if key_findings:
-                            final_answer += "### 关键发现：\n"
-                            for finding in key_findings[:5]:  # 最多显示 5 条
-                                final_answer += f"- {finding}\n"
-                            final_answer += "\n"
-                        
-                        intermediate_conclusions = shared_board.get('intermediate_conclusions', [])
-                        if intermediate_conclusions:
-                            final_answer += "### 中间结论：\n"
-                            for conclusion in intermediate_conclusions[:3]:  # 最多显示 3 条
-                                final_answer += f"- {conclusion}\n"
-                            final_answer += "\n"
-                        
-                        final_answer += "### 总结\n"
-                        final_answer += f"本次协作共调用 {tool_call_count} 次工具，总耗时 {sum(a.get('duration', 1.0) for a in sub_agent_results):.1f} 秒。\n\n"
-                        final_answer += "基于以上分析过程，已完成用户指定的任务。"
-                    
-                    print(f"[SSE] 开始汇总答案，最终长度：{len(final_answer)}")
-                    # 流式输出（字符切片方式）
-                    for i in range(0, len(final_answer), 10):
-                        chunk = final_answer[i:i+10]
-                        chunk_data = json.dumps({
-                            'type': 'final_answer_chunk',
-                            'chunk': chunk
-                        })
-                        print(f"[SSE] 发送汇总 chunk: {chunk}")
-                        yield f"event: final_answer_chunk\ndata: {chunk_data}\n\n"
-                        await asyncio.sleep(0.05)
-                    
-                    # 更新 AI 消息
-                    ai_message.content = final_answer
-                ai_message.thinking_process = thinking_process
-                ai_message.sub_agent_results = sub_agent_results
-                ai_message.msg_metadata = {
-                    "total_duration": sum(a.get("duration", 1.0) for a in sub_agent_results),
-                    "total_tool_calls": tool_call_count,
-                    "agents_used": list(set(a["role"] for a in sub_agent_results)),
-                    "sub_agent_count": len(sub_agent_results)
-                }
+                    # 等待 AI 消息写入完成
+                    await asyncio.sleep(0.1)
             
-            # 完成
-            event_data = json.dumps({
-                'type': 'done',
-                'session_id': session_id,
-                'message_id': ai_message.id,
-                'total_duration': ai_message.msg_metadata.get('total_duration', 0) if ai_message.msg_metadata else 0,
-                # 关键修复：在 done 事件中包含结构化数据
-                'thinking_process': ai_message.thinking_process,
-                'sub_agent_results': ai_message.sub_agent_results,
-                'citations': ai_message.citations
-            })
-            yield f"event: done\ndata: {event_data}\n\n"
+            # 最终提交
+            await db.commit()
+            print(f"[Chat] ✅ 消息处理完成，ID: {ai_message.id}")
             
         except Exception as e:
-            event_data = json.dumps({
-                'type': 'error',
-                'error': str(e),
-                'recoverable': True
-            })
-            yield f"event: error\ndata: {event_data}\n\n"
-        
+            print(f"[Chat] ❌ SSE 生成器错误：{e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            # 关键修复：确保在 SSE 结束后立即保存到数据库
-            print(f"[Chat] 正在保存 AI 消息到数据库，ID: {ai_message.id}")
-            try:
-                await db.commit()
-                print(f"[Chat] AI 消息已保存到数据库")
-            except Exception as save_error:
-                print(f"[Chat] 保存失败：{save_error}")
-                await db.rollback()
-                raise
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
+            # 确保数据库连接关闭
+            await db.close()
 
 
 @router.get("/quick-questions")
